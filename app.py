@@ -12,10 +12,12 @@ if "prenotazioni" not in st.session_state:
 
 if "camere_stato" not in st.session_state:
     st.session_state.camere_stato = {
-        "Camera 1 (Matrimoniale)": {"stato": "Disponibile", "ospite": "-"},
-        "Camera 2 (Doppia)": {"stato": "Occupata", "ospite": "Mario Rossi"},
-        "Camera 3 (Singola)": {"stato": "Disponibile", "ospite": "-"}
+        "Baia di Budoni": {"stato": "Disponibile", "ospite": "-"},
+        "Capo Comino": {"stato": "Occupata", "ospite": "Mario Rossi"},
+        "La Cinta": {"stato": "Disponibile", "ospite": "-"}
+        "Cala Brandinchi": {"stato": "Disponibile", "ospite": "-"}
     }
+    
 
 if "documenti_caricati" not in st.session_state:
     st.session_state.documenti_caricati = []
