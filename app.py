@@ -17,13 +17,16 @@ if "camere_stato" not in st.session_state:
         "Camera 3 (Singola)": {"stato": "Disponibile", "ospite": "-"}
     }
 
+if "documenti_caricati" not in st.session_state:
+    st.session_state.documenti_caricati = []
+
 if "messaggi_chat" not in st.session_state:
     st.session_state.messaggi_chat = [
-        {"ruolo": "assistant", "contenuto": "Ciao! Sono il tuo assistente IA per l'affittacamere. Come posso aiutarti oggi con le camere o le prenotazioni?"}
+        {"ruolo": "assistant", "contenuto": "Ciao! Sono il tuo assistente IA per l'affittacamere. Conosco lo stato delle camere, le prenotazioni e posso leggere i documenti e le fatture che carichi!"}
     ]
 
 st.title("🛏️ Sistema Gestione Affittacamere con IA")
-st.write("Gestionale completo con automazione file e assistente IA integrato.")
+st.write("Gestionale completo con automazione file e assistente IA unificato.")
 
 # Menu laterale per navigare tra le sezioni
 menu = st.sidebar.selectbox("Menu di Navigazione", [
@@ -82,37 +85,65 @@ elif menu == "📋 Elenco Prenotazioni":
 
 elif menu == "📂 Archivio e Analisi File (Fase 5)":
     st.header("Analisi Automatica Fogli di Calcolo e Fatture PDF")
-    st.info("Carica un file Excel/CSV oppure una fattura in PDF: l'app analizzerà il contenuto.")
+    st.info("Carica un file Excel/CSV oppure una fattura in PDF: l'app memorizzerà i dati per l'IA.")
+    
     file_caricato = st.file_uploader("Carica un documento (Excel, CSV o PDF)", type=["csv", "xlsx", "pdf"])
+    
     if file_caricato is not None:
         try:
             if file_caricato.name.endswith('.csv'):
                 df_caricato = pd.read_csv(file_caricato)
                 st.success(f"File CSV '{file_caricato.name}' letto con successo!")
                 st.dataframe(df_caricato, use_container_width=True)
+                
+                # Salviamo in memoria per l'IA
+                testo_righe = df_caricato.to_string(index=False)
+                st.session_state.documenti_caricati.append({
+                    "nome": file_caricato.name,
+                    "tipo": "CSV/Excel",
+                    "contenuto": testo_righe
+                })
+                
             elif file_caricato.name.endswith(('.xls', '.xlsx')):
                 df_caricato = pd.read_excel(file_caricato)
                 st.success(f"File Excel '{file_caricato.name}' letto con successo!")
                 st.dataframe(df_caricato, use_container_width=True)
+                
+                # Salviamo in memoria per l'IA
+                testo_righe = df_caricato.to_string(index=False)
+                st.session_state.documenti_caricati.append({
+                    "nome": file_caricato.name,
+                    "tipo": "Excel",
+                    "contenuto": testo_righe
+                })
+                
             elif file_caricato.name.endswith('.pdf'):
-                st.success(f"File PDF '{file_caricato.name}' caricato con successo!")
                 with pdfplumber.open(file_caricato) as pdf:
                     testo_completo = ""
                     for pagina in pdf.pages:
                         testo_estr = pagina.extract_text()
                         if testo_estr:
                             testo_completo += testo_estr + "\n"
-                st.subheader("📄 Testo estratto dal PDF:")
+                            
+                st.success(f"File PDF '{file_caricato.name}' letto e memorizzato con successo!")
                 if testo_completo.strip():
                     st.text_area("Contenuto del documento:", testo_completo, height=250)
+                    
+                    # Salviamo in memoria per l'IA
+                    st.session_state.documenti_caricati.append({
+                        "nome": file_caricato.name,
+                        "tipo": "PDF",
+                        "contenuto": testo_completo
+                    })
                 else:
                     st.warning("Il PDF sembra un'immagine scansionata.")
+                    
         except Exception as e:
             st.error(f"Errore nella lettura del file: {e}")
 
 elif menu == "💬 Chat IA Assistente (Fase 7)":
-    st.header("Assistente Virtuale IA")
-    st.write("Fai domande o chiedi informazioni sulle camere e sulla gestione della struttura.")
+    st.header("Assistente Virtuale IA del B&B")
+    st.write("Chiedi all'assistente qualsiasi cosa: camere, prenotazioni, dati di Excel o fatture caricate.")
     
     # Mostriamo la cronologia della chat
     for messaggio in st.session_state.messaggi_chat:
@@ -120,15 +151,42 @@ elif menu == "💬 Chat IA Assistente (Fase 7)":
             st.markdown(messaggio["contenuto"])
             
     # Input della chat in basso
-    input_utente = st.chat_input("Scrivi un messaggio all'IA...")
+    input_utente = st.chat_input("Es. 'Quali camere sono libere?' oppure 'Cosa c'è scritto nell'ultima fattura?'")
     if input_utente:
-        # Aggiungiamo il messaggio dell'utente
         st.session_state.messaggi_chat.append({"ruolo": "user", "contenuto": input_utente})
         with st.chat_message("user"):
             st.markdown(input_utente)
             
-        # Risposta automatica dell'assistente
-        risposta_ia = f"Ho ricevuto la tua richiesta: '{input_utente}'. Nelle prossime configurazioni collegheremo qui i modelli avanzati per darti risposte mirate sui dati del B&B!"
+        testo_utente = input_utente.lower()
+        risposta_ia = ""
+        
+        # Logica di risposta basata sulle richieste
+        if "camera" in testo_utente or "stato" in testo_utente or "liber" in testo_utente:
+            report_camere = "Ecco la situazione attuale delle camere:\n"
+            for camera, info in st.session_state.camere_stato.items():
+                report_camere += f"- **{camera}**: {info['stato']} (Ospite: {info['ospite']})\n"
+            risposta_ia = report_camere
+            
+        elif "prenotazion" in testo_utente or "ospit" in testo_utente:
+            if len(st.session_state.prenotazioni) > 0:
+                report_prenotazioni = f"Ci sono {len(st.session_state.prenotazioni)} prenotazioni:\n"
+                for p in st.session_state.prenotazioni:
+                    report_prenotazioni += f"- **{p['Ospite']}** ({p['Camera']}) dal {p['Arrivo']} al {p['Partenza']} - Tot: {p['Prezzo (€)']}€\n"
+                risposta_ia = report_prenotazioni
+            else:
+                risposta_ia = "Al momento non ci sono prenotazioni registrate."
+                
+        elif "file" in testo_utente or "document" in testo_utente or "fattur" in testo_utente or "excel" in testo_utente:
+            if len(st.session_state.documenti_caricati) > 0:
+                report_doc = f"Ho memorizzato {len(st.session_state.documenti_caricati)} documenti/file:\n"
+                for doc in st.session_state.documenti_caricati:
+                    report_doc += f"\n📄 **{doc['nome']}** ({doc['tipo']}):\n```text\n{doc['contenuto'][:500]}...\n```\n"
+                risposta_ia = report_doc
+            else:
+                risposta_ia = "Non hai ancora caricato nessun file Excel o PDF nella sezione 'Archivio e Analisi File'."
+        else:
+            risposta_ia = f"Ho ricevuto la tua richiesta ('{input_utente}'). Posso darti informazioni sulle camere, sulle prenotazioni o sui file e fatture caricati. Prova a chiedermi lo stato delle camere o i dettagli dei file!"
+
         st.session_state.messaggi_chat.append({"ruolo": "assistant", "contenuto": risposta_ia})
         with st.chat_message("assistant"):
             st.markdown(risposta_ia)
