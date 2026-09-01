@@ -13,7 +13,6 @@ if "prenotazioni" not in st.session_state:
 if "camere_stato" not in st.session_state:
     st.session_state.camere_stato = {
         "Baia di Budoni": {"stato": "Disponibile", "ospite": "-"},
-        "Capo Comino": {"stato": "Occupata", "ospite": "Mario Rossi"},
         "La Cinta": {"stato": "Disponibile", "ospite": "-"}
         "Cala Brandinchi": {"stato": "Disponibile", "ospite": "-"}
     }
