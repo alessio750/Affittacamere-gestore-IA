@@ -31,7 +31,7 @@ MODELLI_GEMINI = [
 MAX_DOCUMENTI_IA = 6
 MAX_CARATTERI_PER_DOC = 12000
 MAX_MESSAGGI_STORICO_IA = 10
-VERSIONE_APP = "2.4 - Motore contabile Python avanzato"
+VERSIONE_APP = "2.4.1 - Domande contabili composte"
 
 CAMERE_DEFAULT = [
     "Baia di Budoni",
@@ -719,6 +719,8 @@ def risposta_contabile_python(domanda):
         return risposta_python("Filtro contabile (Python)", elenco)
 
     # Top N fatture/documenti più costosi.
+    # Gestisce anche domande composte, ad esempio:
+    # "Quali sono le 2 fatture più costose e che percentuale rappresentano sul totale?"
     top_match = re.search(r"(?:le|i)?\s*(\d+)\s+(?:fattur\w*|document\w*)\s+(?:piu|più)\s+cost", q)
     if top_match or (any(x in q for x in ["fattura piu costosa", "fattura più costosa", "documento piu costoso", "documento più costoso"])):
         n = int(top_match.group(1)) if top_match else 1
@@ -727,6 +729,28 @@ def risposta_contabile_python(domanda):
         elenco = [f"Le **{len(righe)}** fatture/documenti più costosi sono:"]
         for pos, (_, r) in enumerate(righe.iterrows(), start=1):
             elenco.append(f"{pos}. **{r['Fornitore']}** — {r['Numero documento']} — **{formatta_euro(r['Totale (€)'])}**")
+
+        # Se la stessa domanda chiede anche altri calcoli, li aggiungiamo nella stessa risposta.
+        somma_top = float(righe["Totale (€)"].sum())
+        iva_top = float(righe["IVA (€)"].sum())
+        imponibile_top = float(righe["Imponibile (€)"].sum())
+        percentuale_top = (somma_top / riepilogo["totale"] * 100) if riepilogo["totale"] else 0
+
+        if any(x in q for x in ["insieme", "complessiv", "somma", "quanto valgono", "totale delle", "totale di queste"]):
+            elenco.append(f"- Totale delle {len(righe)} fatture: **{formatta_euro(somma_top)}**")
+
+        if "percent" in q or "incidenza" in q or "rappresentano sul totale" in q or "del totale" in q:
+            elenco.append(
+                f"- Incidenza sul totale complessivo: **{percentuale_top:.2f}%** "
+                f"({formatta_euro(somma_top)} su {formatta_euro(riepilogo['totale'])})"
+            )
+
+        if "iva" in q:
+            elenco.append(f"- IVA complessiva delle {len(righe)} fatture: **{formatta_euro(iva_top)}**")
+
+        if "imponibile" in q:
+            elenco.append(f"- Imponibile complessivo delle {len(righe)} fatture: **{formatta_euro(imponibile_top)}**")
+
         return risposta_python("Classifica fatture (Python)", elenco)
 
     if any(x in q for x in ["fattura meno costosa", "fattura piu economica", "fattura più economica", "documento meno costoso"]):
