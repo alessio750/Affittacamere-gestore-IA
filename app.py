@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -24,6 +25,49 @@ st.set_page_config(
     layout="wide",
 )
 
+# =========================================================
+# ACCESSO PROTETTO
+# =========================================================
+def verifica_accesso():
+    """Blocca l'app finché non viene inserita la password salvata nei Secrets."""
+    if "accesso_autorizzato" not in st.session_state:
+        st.session_state.accesso_autorizzato = False
+
+    password_configurata = str(st.secrets.get("APP_PASSWORD", "") or "")
+
+    if not password_configurata:
+        st.error(
+            "🔐 Accesso non configurato. Aggiungi APP_PASSWORD nei Secrets di Streamlit "
+            "prima di utilizzare l'app."
+        )
+        st.code('APP_PASSWORD = "la-tua-password"', language="toml")
+        st.stop()
+
+    if not st.session_state.accesso_autorizzato:
+        st.title("🔐 Accesso riservato")
+        st.write("Inserisci la password per aprire il gestionale dell'affittacamere.")
+
+        with st.form("form_accesso", clear_on_submit=True):
+            password_inserita = st.text_input("Password", type="password")
+            entra = st.form_submit_button("Accedi", use_container_width=True, type="primary")
+
+        if entra:
+            if hmac.compare_digest(password_inserita, password_configurata):
+                st.session_state.accesso_autorizzato = True
+                st.rerun()
+            else:
+                st.error("Password non corretta.")
+        st.stop()
+
+    with st.sidebar:
+        st.caption("🔐 Accesso protetto attivo")
+        if st.button("🚪 Esci", use_container_width=True):
+            st.session_state.accesso_autorizzato = False
+            st.rerun()
+
+
+verifica_accesso()
+
 MODELLI_GEMINI = [
     "gemini-3.6-flash",
     "gemini-3.5-flash",
@@ -33,7 +77,7 @@ MODELLI_GEMINI = [
 MAX_DOCUMENTI_IA = 6
 MAX_CARATTERI_PER_DOC = 12000
 MAX_MESSAGGI_STORICO_IA = 10
-VERSIONE_APP = "2.8 - Metadati fatture + domande composte complete"
+VERSIONE_APP = "2.9 - Accesso protetto + motore 2.8"
 MAX_ANALISI_PARALLELE = 2
 GEMINI_TIMEOUT_ESTRAZIONE_MS = 25000
 MODELLI_ESTRAZIONE_GEMINI = MODELLI_GEMINI[:2]
