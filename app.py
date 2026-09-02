@@ -1,4 +1,4 @@
-
+import hashlib
 import io
 import json
 import os
@@ -31,7 +31,7 @@ MODELLI_GEMINI = [
 MAX_DOCUMENTI_IA = 6
 MAX_CARATTERI_PER_DOC = 12000
 MAX_MESSAGGI_STORICO_IA = 10
-VERSIONE_APP = "2.3 - Contabilità intelligente + retry IA"
+VERSIONE_APP = "2.3.1 - Fix caricamento + Contabilità intelligente"
 
 CAMERE_DEFAULT = [
     "Baia di Budoni",
@@ -116,7 +116,9 @@ def normalizza_testo(testo):
 
 
 def hash_bytes(dati):
-    return hashlib.sha256(dati).hexdigest()
+    # Import locale intenzionale: evita errori NameError anche in caso di rerun/cache anomali.
+    import hashlib as _hashlib
+    return _hashlib.sha256(dati).hexdigest()
 
 
 def euro(valore):
