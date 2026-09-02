@@ -31,7 +31,7 @@ MODELLI_GEMINI = [
 MAX_DOCUMENTI_IA = 6
 MAX_CARATTERI_PER_DOC = 12000
 MAX_MESSAGGI_STORICO_IA = 10
-VERSIONE_APP = "2.3.1 - Fix caricamento + Contabilità intelligente"
+VERSIONE_APP = "2.4 - Motore contabile Python avanzato"
 
 CAMERE_DEFAULT = [
     "Baia di Budoni",
@@ -635,63 +635,219 @@ def formatta_euro(valore):
 
 
 def risposta_contabile_python(domanda):
-    """Risponde senza Gemini alle domande contabili semplici già coperte dai dati strutturati."""
+    """Risponde senza Gemini a molte domande numeriche/contabili sui dati strutturati.
+
+    Gemini resta necessario per interpretazioni, consigli, cause, previsioni e analisi qualitative.
+    """
     if not st.session_state.contabilita:
         return None
 
     q = normalizza_testo(domanda)
     segnali_contabili = [
         "spes", "totale", "iva", "imponibile", "fattur", "document",
-        "fornitor", "categoria", "pagato", "pagata", "quanto", "quante", "quanti"
+        "fornitor", "categoria", "pagato", "pagata", "quanto", "quante", "quanti",
+        "media", "percent", "piu cost", "meno cost", "superior", "inferior", "confront",
+        "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto",
+        "settembre", "ottobre", "novembre", "dicembre"
     ]
     if not any(x in q for x in segnali_contabili):
         return None
 
-    # Le richieste interpretative restano a Gemini.
-    segnali_ia = [
+    # Se la richiesta chiede giudizi o spiegazioni, lasciamo il lavoro a Gemini.
+    segnali_interpretativi = [
         "analizza", "spiega", "consigli", "consiglio", "risparm", "anomali",
-        "perche", "perché", "conviene", "preved", "strateg", "valuta", "confronta"
+        "perche", "perché", "conviene", "preved", "strateg", "valuta",
+        "cosa ne pensi", "come mai", "motivo", "sugger", "ottimizz"
     ]
-    if any(x in q for x in segnali_ia):
+    if any(x in q for x in segnali_interpretativi):
         return None
 
-    df = dataframe_contabilita()
+    df = dataframe_contabilita().copy()
     if df.empty:
         return None
+
+    # Colonne numeriche sempre coerenti.
+    for col in ["Imponibile (€)", "IVA (€)", "Totale (€)"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
     riepilogo = riepilogo_contabile_python()
 
-    # Riconosce un fornitore già presente nella domanda.
-    fornitori = [str(x) for x in df["Fornitore"].dropna().unique() if str(x).strip()]
-    for fornitore in sorted(fornitori, key=len, reverse=True):
-        if normalizza_testo(fornitore) in q:
-            righe = df[df["Fornitore"] == fornitore]
-            tot = float(righe["Totale (€)"].sum())
-            iva = float(righe["IVA (€)"].sum())
-            imp = float(righe["Imponibile (€)"].sum())
-            return (
-                f"📊 **Dati calcolati direttamente da Python**\n\n"
-                f"Per **{fornitore}** risultano **{len(righe)} documenti**:\n"
-                f"- Totale: **{formatta_euro(tot)}**\n"
-                f"- Imponibile: **{formatta_euro(imp)}**\n"
-                f"- IVA: **{formatta_euro(iva)}**\n\n"
-                "Questa risposta non ha utilizzato Gemini."
-            )
+    def risposta_python(titolo, righe_testo):
+        if isinstance(righe_testo, str):
+            righe_testo = [righe_testo]
+        return (
+            f"📊 **{titolo}**\n\n" + "\n".join(righe_testo) +
+            "\n\n⚡ Risposta calcolata direttamente da Python sui dati della pagina Contabilità, senza chiamare Gemini."
+        )
 
-    # Riconosce una categoria già presente nella domanda.
+    def filtro_righe_per_nome(colonna, valori):
+        trovati = []
+        for valore in sorted(valori, key=len, reverse=True):
+            if normalizza_testo(valore) in q:
+                trovati.append(valore)
+        # Evita duplicati mantenendo l'ordine.
+        return list(dict.fromkeys(trovati))
+
+    fornitori = [str(x) for x in df["Fornitore"].dropna().unique() if str(x).strip()]
     categorie = [str(x) for x in df["Categoria"].dropna().unique() if str(x).strip()]
-    for categoria in sorted(categorie, key=len, reverse=True):
-        if normalizza_testo(categoria) in q:
-            righe = df[df["Categoria"] == categoria]
-            tot = float(righe["Totale (€)"].sum())
-            return (
-                f"📊 **Dati calcolati direttamente da Python**\n\n"
-                f"La categoria **{categoria}** comprende **{len(righe)} documenti** "
-                f"per un totale di **{formatta_euro(tot)}**.\n\n"
-                "Questa risposta non ha utilizzato Gemini."
-            )
+    fornitori_trovati = filtro_righe_per_nome("Fornitore", fornitori)
+    categorie_trovate = filtro_righe_per_nome("Categoria", categorie)
+
+    # Soglia monetaria, es. "fatture superiori a 200 euro".
+    soglia_match = re.search(r"(?:superior[ei]?|sopra|oltre|maggior[ei]? di|piu di|più di)\s*(?:a|di)?\s*€?\s*(\d+(?:[\.,]\d+)?)", q)
+    if soglia_match and any(x in q for x in ["fattur", "document", "spes"]):
+        soglia = float(soglia_match.group(1).replace(".", "").replace(",", "."))
+        righe = df[df["Totale (€)"] > soglia].sort_values("Totale (€)", ascending=False)
+        if righe.empty:
+            return risposta_python("Filtro contabile (Python)", f"Non risultano documenti con totale superiore a **{formatta_euro(soglia)}**.")
+        elenco = [f"Documenti con totale superiore a **{formatta_euro(soglia)}**: **{len(righe)}**"]
+        for _, r in righe.head(20).iterrows():
+            elenco.append(f"- **{r['Fornitore']}** — {r['Numero documento']} — **{formatta_euro(r['Totale (€)'])}**")
+        if len(righe) > 20:
+            elenco.append(f"- … e altri {len(righe)-20} documenti")
+        return risposta_python("Filtro contabile (Python)", elenco)
+
+    soglia_bassa_match = re.search(r"(?:inferior[ei]?|sotto|meno di)\s*(?:a|di)?\s*€?\s*(\d+(?:[\.,]\d+)?)", q)
+    if soglia_bassa_match and any(x in q for x in ["fattur", "document", "spes"]):
+        soglia = float(soglia_bassa_match.group(1).replace(".", "").replace(",", "."))
+        righe = df[df["Totale (€)"] < soglia].sort_values("Totale (€)")
+        if righe.empty:
+            return risposta_python("Filtro contabile (Python)", f"Non risultano documenti con totale inferiore a **{formatta_euro(soglia)}**.")
+        elenco = [f"Documenti con totale inferiore a **{formatta_euro(soglia)}**: **{len(righe)}**"]
+        for _, r in righe.head(20).iterrows():
+            elenco.append(f"- **{r['Fornitore']}** — {r['Numero documento']} — **{formatta_euro(r['Totale (€)'])}**")
+        return risposta_python("Filtro contabile (Python)", elenco)
+
+    # Top N fatture/documenti più costosi.
+    top_match = re.search(r"(?:le|i)?\s*(\d+)\s+(?:fattur\w*|document\w*)\s+(?:piu|più)\s+cost", q)
+    if top_match or (any(x in q for x in ["fattura piu costosa", "fattura più costosa", "documento piu costoso", "documento più costoso"])):
+        n = int(top_match.group(1)) if top_match else 1
+        n = max(1, min(n, 20))
+        righe = df.sort_values("Totale (€)", ascending=False).head(n)
+        elenco = [f"Le **{len(righe)}** fatture/documenti più costosi sono:"]
+        for pos, (_, r) in enumerate(righe.iterrows(), start=1):
+            elenco.append(f"{pos}. **{r['Fornitore']}** — {r['Numero documento']} — **{formatta_euro(r['Totale (€)'])}**")
+        return risposta_python("Classifica fatture (Python)", elenco)
+
+    if any(x in q for x in ["fattura meno costosa", "fattura piu economica", "fattura più economica", "documento meno costoso"]):
+        r = df.sort_values("Totale (€)").iloc[0]
+        return risposta_python(
+            "Fattura meno costosa (Python)",
+            f"La fattura/documento meno costoso è **{r['Fornitore']} — {r['Numero documento']}**, per **{formatta_euro(r['Totale (€)'])}**."
+        )
+
+    # Media fatture.
+    if "media" in q and any(x in q for x in ["fattur", "document", "spes", "totale"]):
+        media = float(df["Totale (€)"].mean())
+        return risposta_python(
+            "Media contabile (Python)",
+            [f"- Numero documenti: **{len(df)}**", f"- Valore medio per documento: **{formatta_euro(media)}**"]
+        )
+
+    # Dati filtrati per fornitore o categoria, inclusa IVA/imponibile.
+    if len(fornitori_trovati) == 1:
+        fornitore = fornitori_trovati[0]
+        righe = df[df["Fornitore"] == fornitore]
+        tot = float(righe["Totale (€)"].sum())
+        iva = float(righe["IVA (€)"].sum())
+        imp = float(righe["Imponibile (€)"].sum())
+        percentuale = (tot / riepilogo["totale"] * 100) if riepilogo["totale"] else 0
+        return risposta_python(
+            f"Dati fornitore: {fornitore} (Python)",
+            [
+                f"- Documenti: **{len(righe)}**",
+                f"- Totale: **{formatta_euro(tot)}**",
+                f"- Imponibile: **{formatta_euro(imp)}**",
+                f"- IVA: **{formatta_euro(iva)}**",
+                f"- Incidenza sulla spesa complessiva: **{percentuale:.1f}%**",
+            ]
+        )
+
+    if len(categorie_trovate) == 1:
+        categoria = categorie_trovate[0]
+        righe = df[df["Categoria"] == categoria]
+        tot = float(righe["Totale (€)"].sum())
+        iva = float(righe["IVA (€)"].sum())
+        imp = float(righe["Imponibile (€)"].sum())
+        percentuale = (tot / riepilogo["totale"] * 100) if riepilogo["totale"] else 0
+        return risposta_python(
+            f"Categoria: {categoria} (Python)",
+            [
+                f"- Documenti: **{len(righe)}**",
+                f"- Totale: **{formatta_euro(tot)}**",
+                f"- Imponibile: **{formatta_euro(imp)}**",
+                f"- IVA: **{formatta_euro(iva)}**",
+                f"- Incidenza sulla spesa complessiva: **{percentuale:.1f}%**",
+            ]
+        )
+
+    # Confronto numerico fra due fornitori o due categorie.
+    if "confront" in q and len(fornitori_trovati) >= 2:
+        a, b = fornitori_trovati[:2]
+        ta = float(df[df["Fornitore"] == a]["Totale (€)"].sum())
+        tb = float(df[df["Fornitore"] == b]["Totale (€)"].sum())
+        diff = abs(ta - tb)
+        maggiore = a if ta >= tb else b
+        return risposta_python(
+            "Confronto fornitori (Python)",
+            [f"- **{a}**: {formatta_euro(ta)}", f"- **{b}**: {formatta_euro(tb)}", f"- Differenza: **{formatta_euro(diff)}**", f"- Spesa maggiore: **{maggiore}**"]
+        )
+
+    if "confront" in q and len(categorie_trovate) >= 2:
+        a, b = categorie_trovate[:2]
+        ta = float(df[df["Categoria"] == a]["Totale (€)"].sum())
+        tb = float(df[df["Categoria"] == b]["Totale (€)"].sum())
+        diff = abs(ta - tb)
+        maggiore = a if ta >= tb else b
+        return risposta_python(
+            "Confronto categorie (Python)",
+            [f"- **{a}**: {formatta_euro(ta)}", f"- **{b}**: {formatta_euro(tb)}", f"- Differenza: **{formatta_euro(diff)}**", f"- Categoria con spesa maggiore: **{maggiore}**"]
+        )
+
+    # Analisi per mese sulla colonna Data. Supporta date YYYY-MM-DD e formati leggibili da pandas.
+    mesi = {
+        "gennaio": 1, "febbraio": 2, "marzo": 3, "aprile": 4, "maggio": 5, "giugno": 6,
+        "luglio": 7, "agosto": 8, "settembre": 9, "ottobre": 10, "novembre": 11, "dicembre": 12,
+    }
+    mesi_trovati = [(nome, num) for nome, num in mesi.items() if nome in q]
+    if mesi_trovati:
+        date_parsed = pd.to_datetime(df["Data"], errors="coerce", dayfirst=True)
+        anno_match = re.search(r"\b(20\d{2})\b", q)
+        anno = int(anno_match.group(1)) if anno_match else None
+        risultati_mesi = []
+        for nome, num in mesi_trovati[:2]:
+            mask = date_parsed.dt.month.eq(num)
+            if anno:
+                mask &= date_parsed.dt.year.eq(anno)
+            tot = float(df.loc[mask, "Totale (€)"].sum())
+            iva = float(df.loc[mask, "IVA (€)"].sum())
+            count = int(mask.sum())
+            risultati_mesi.append((nome, tot, iva, count))
+
+        if len(risultati_mesi) == 2 and any(x in q for x in ["confront", "rispetto", "differenza", "aumento", "diminuzione"]):
+            a, b = risultati_mesi
+            diff = b[1] - a[1]
+            perc = (diff / a[1] * 100) if a[1] else None
+            righe_out = [
+                f"- **{a[0].capitalize()}**: {formatta_euro(a[1])} ({a[3]} documenti)",
+                f"- **{b[0].capitalize()}**: {formatta_euro(b[1])} ({b[3]} documenti)",
+                f"- Differenza {b[0]} - {a[0]}: **{formatta_euro(diff)}**",
+            ]
+            if perc is not None:
+                righe_out.append(f"- Variazione percentuale: **{perc:+.1f}%**")
+            return risposta_python("Confronto mensile (Python)", righe_out)
+
+        nome, tot, iva, count = risultati_mesi[0]
+        return risposta_python(
+            f"Riepilogo di {nome} (Python)",
+            [f"- Documenti: **{count}**", f"- Totale spese: **{formatta_euro(tot)}**", f"- IVA: **{formatta_euro(iva)}**"]
+        )
 
     chiede_categoria_top = (
         "categoria" in q and any(x in q for x in ["maggiore", "maggior", "piu", "più", "inciso", "alta", "costosa"])
+    )
+    chiede_fornitore_top = (
+        "fornitor" in q and any(x in q for x in ["maggiore", "maggior", "piu", "più", "cost", "speso"])
     )
     chiede_totale = any(x in q for x in ["totale", "quanto abbiamo speso", "quanto ho speso", "spesa complessiva", "spese complessive"])
     chiede_iva = "iva" in q
@@ -712,15 +868,19 @@ def risposta_contabile_python(domanda):
         if not per_categoria.empty:
             nome = str(per_categoria.index[0])
             valore = float(per_categoria.iloc[0])
-            parti.append(f"- Categoria con maggiore spesa: **{nome}** ({formatta_euro(valore)})")
+            percentuale = (valore / riepilogo["totale"] * 100) if riepilogo["totale"] else 0
+            parti.append(f"- Categoria con maggiore spesa: **{nome}** ({formatta_euro(valore)}, **{percentuale:.1f}%** del totale)")
+    if chiede_fornitore_top:
+        per_fornitore = df.groupby("Fornitore")["Totale (€)"].sum().sort_values(ascending=False)
+        if not per_fornitore.empty:
+            nome = str(per_fornitore.index[0])
+            valore = float(per_fornitore.iloc[0])
+            parti.append(f"- Fornitore con maggiore spesa: **{nome}** ({formatta_euro(valore)})")
 
     if not parti:
         return None
 
-    return (
-        "📊 **Risposta dalla Contabilità (Python)**\n\n" + "\n".join(parti) +
-        "\n\n⚡ Risposta ottenuta senza chiamare Gemini, usando i dati già estratti nella pagina Contabilità."
-    )
+    return risposta_python("Risposta dalla Contabilità (Python)", parti)
 
 
 def invia_a_gemini(domanda):
@@ -1380,7 +1540,7 @@ elif menu == "💬 Chat IA Assistente":
     st.header("Assistente Virtuale IA dell'Affittacamere")
     st.write(
         "Chiedi qualsiasi cosa su camere, prenotazioni, incassi, spese, Excel, fatture e contabilità. "
-        "Le domande contabili semplici vengono risposte direttamente da Python; Gemini interviene solo quando serve interpretazione o analisi."
+        "Totali, filtri, classifiche e molti confronti contabili vengono risposti direttamente da Python; Gemini interviene quando serve interpretazione, spiegazione o consulenza."
     )
 
     for messaggio in st.session_state.messaggi_chat:
