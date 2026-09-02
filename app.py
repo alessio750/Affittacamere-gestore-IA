@@ -33,7 +33,7 @@ MODELLI_GEMINI = [
 MAX_DOCUMENTI_IA = 6
 MAX_CARATTERI_PER_DOC = 12000
 MAX_MESSAGGI_STORICO_IA = 10
-VERSIONE_APP = "2.7 - Timeout Gemini + Retry file lenti"
+VERSIONE_APP = "2.8 - Metadati fatture + domande composte complete"
 MAX_ANALISI_PARALLELE = 2
 GEMINI_TIMEOUT_ESTRAZIONE_MS = 25000
 MODELLI_ESTRAZIONE_GEMINI = MODELLI_GEMINI[:2]
@@ -364,6 +364,98 @@ def _categoria_python(testo):
     return "Altro"
 
 
+def _numero_documento_da_nome_file(nome):
+    """Ricava un numero documento plausibile dal nome file come fallback."""
+    base = os.path.basename(str(nome or ""))
+    base = re.sub(r"\.pdf$", "", base, flags=re.I).strip()
+    # Fatture elettroniche convertite in PDF spesso hanno " - NUMERO" in coda.
+    if " - " in base:
+        cand = base.rsplit(" - ", 1)[-1].strip()
+    elif re.search(r"fattura[_\s-]*num[_\s-]*", base, flags=re.I):
+        cand = re.split(r"fattura[_\s-]*num[_\s-]*", base, flags=re.I)[-1].strip()
+    else:
+        cand = base
+    cand = re.sub(r"\s*\(\d+\)$", "", cand).strip()
+    # Evita di usare come numero l'intero identificativo tecnico XML/P7M.
+    if ".xml" in cand.lower() or ".p7m" in cand.lower():
+        return ""
+    if 1 <= len(cand) <= 60 and re.search(r"\d", cand):
+        return cand
+    return ""
+
+
+def _numero_documento_python(testo, nome_file):
+    patterns = [
+        r"(?:numero\s+(?:documento|fattura)|num\.?\s*(?:documento|fattura)?|fattura\s+(?:n(?:umero)?[\.°º]?|nr\.?))\s*[:#\-]?\s*([A-Z0-9][A-Z0-9_./\-]{0,59})",
+        r"(?:n(?:umero)?[\.°º]?|nr\.?)\s*[:#\-]?\s*([A-Z0-9][A-Z0-9_./\-]{1,59})\s*(?:del|data|$)",
+        r"(?:documento)\s*[:#\-]\s*([A-Z0-9][A-Z0-9_./\-]{1,59})",
+    ]
+    cand = _cerca_prima_regex(testo, patterns)
+    cand = cand.strip()
+    generici = {"r", "r.", "n", "n.", "nr", "nr.", "fattura", "documento"}
+    if cand.lower() in generici or len(cand) < 2 or not re.search(r"\d", cand):
+        cand = ""
+    return cand or _numero_documento_da_nome_file(nome_file)
+
+
+def _data_documento_python(testo):
+    patterns = [
+        r"(?:data\s+(?:documento|fattura|emissione)|data\s+doc\.?|emessa\s+il|fattura[^\n]{0,40}?del)\s*[:\-]?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{2}[./-]\d{2})",
+        r"(?:del)\s+(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})",
+    ]
+    cand = _cerca_prima_regex(testo, patterns)
+    if not cand:
+        # Fallback prudente: prima data plausibile nella parte iniziale del documento.
+        matches = re.findall(r"(?<!\d)(\d{1,2}[./-]\d{1,2}[./-](?:20)?\d{2}|20\d{2}[./-]\d{1,2}[./-]\d{1,2})(?!\d)", (testo or "")[:3500])
+        for m in matches:
+            try:
+                d = pd.to_datetime(m, dayfirst=True, errors="raise")
+                if 2000 <= d.year <= 2100:
+                    cand = m
+                    break
+            except Exception:
+                pass
+    return _normalizza_data_documento(cand)
+
+
+def _pulisci_fornitore(cand):
+    cand = re.sub(r"\s+", " ", str(cand or "")).strip(" :-\t")
+    cand = re.split(r"\b(?:P\.?IVA|PARTITA IVA|CODICE FISCALE|C\.?F\.?)\b", cand, maxsplit=1, flags=re.I)[0].strip(" -,:")
+    generici = {"cliente", "fornitore", "cedente", "prestatore", "cedente prestatore", "cessionario", "committente", "destinatario"}
+    if normalizza_testo(cand) in generici or len(cand) < 3:
+        return ""
+    return cand[:120]
+
+
+def _fornitore_python(testo):
+    # Prima cerca esplicitamente il CEDENTE/PRESTATORE: nelle fatture elettroniche è il fornitore.
+    patterns = [
+        r"(?:cedente\s*/?\s*prestatore|cedente prestatore|dati del cedente[^\n]*)\s*[:\-]?\s*(?:denominazione\s*[:\-]?\s*)?([^\n]{3,120})",
+        r"(?:fornitore|ragione sociale fornitore)\s*[:\-]?\s*([^\n]{3,120})",
+        r"(?:denominazione cedente|denominazione prestatore)\s*[:\-]?\s*([^\n]{3,120})",
+    ]
+    for p in patterns:
+        cand = _pulisci_fornitore(_cerca_prima_regex(testo, [p]))
+        if cand:
+            return cand
+
+    # Fallback per PDF di cortesia: cerca ragioni sociali nelle prime righe, evitando la sezione CLIENTE.
+    prime = (testo or "")[:5000]
+    linee = [re.sub(r"\s+", " ", x).strip() for x in prime.splitlines() if x.strip()]
+    suffisso = re.compile(r"\b(?:S\.?R\.?L\.?|SRL|S\.?P\.?A\.?|SPA|S\.?N\.?C\.?|SNC|S\.?A\.?S\.?|SAS|SOCIETA'|SOCIETÀ)\b", re.I)
+    candidati = []
+    for i, linea in enumerate(linee[:80]):
+        n = normalizza_testo(linea)
+        if any(g in n for g in ["cliente", "cessionario", "committente", "destinatario"]):
+            continue
+        if suffisso.search(linea) and not any(x in n for x in ["p iva", "partita iva", "codice fiscale"]):
+            candidati.append(_pulisci_fornitore(linea))
+    candidati = [c for c in candidati if c]
+    if candidati:
+        return candidati[0]
+    return ""
+
+
 def estrai_contabilita_python(doc):
     """Prova a estrarre una fattura senza IA.
 
@@ -401,21 +493,14 @@ def estrai_contabilita_python(doc):
     if imponibile != 0 and abs((imponibile + iva) - totale) > tolleranza:
         return None
 
-    fornitore = _cerca_prima_regex(testo, [
-        r"(?:fornitore|cedente\s*/?\s*prestatore|cedente prestatore)\s*[:\-]?\s*([^\n]{3,100})",
-        r"(?:denominazione|ragione sociale)\s*[:\-]?\s*([^\n]{3,100})",
-    ])
-    # Se non siamo riusciti a identificare almeno il fornitore, preferiamo Gemini:
-    # è meglio una chiamata IA in più che inserire una riga contabile incompleta.
+    fornitore = _fornitore_python(testo)
+    numero_documento = _numero_documento_python(testo, doc.get("nome", ""))
+    data_documento = _data_documento_python(testo)
+
+    # Se il fornitore resta ambiguo, lasciamo il documento a Gemini. Numero e data invece
+    # hanno fallback robusti e non devono più comparire come "r." o vuoti quando ricavabili.
     if not fornitore:
         return None
-    numero_documento = _cerca_prima_regex(testo, [
-        r"(?:numero\s+(?:documento|fattura)|n[\.°º]?\s*(?:fattura)?|fattura\s+n[\.°º]?)\s*[:\-]?\s*([A-Z0-9_./\-]{1,50})",
-        r"(?:documento)\s*[:\-]?\s*([A-Z0-9_./\-]{1,50})",
-    ])
-    data_raw = _cerca_prima_regex(testo, [
-        r"(?:data\s+(?:documento|fattura|emissione)|data)\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})",
-    ])
 
     aliquote = re.findall(r"\b(\d{1,2}(?:[\.,]\d+)?)\s*%", testo)
     aliquote_norm = []
@@ -440,7 +525,7 @@ def estrai_contabilita_python(doc):
         "tipo_documento": "Fattura",
         "fornitore": fornitore,
         "numero_documento": numero_documento,
-        "data_documento": _normalizza_data_documento(data_raw),
+        "data_documento": data_documento,
         "categoria": _categoria_python(testo),
         "imponibile": round(imponibile, 2),
         "iva": round(iva, 2),
@@ -496,6 +581,9 @@ Categorie ammesse:
 
 Regole:
 - Non inventare dati mancanti.
+- FORNITORE significa SEMPRE il cedente/prestatore che emette la fattura, MAI il cliente/cessionario/committente.
+- Per numero_documento estrai il vero numero della fattura/documento (es. 47, 19240, MA_2026_0003861), non etichette come "r." o "n.".
+- Per data_documento usa la data di emissione della fattura, non la data di pagamento/ricezione se sono diverse.
 - Gli importi devono essere numeri JSON, senza simbolo euro.
 - Se il documento contiene più aliquote IVA, usa aliquota_iva = "Mista".
 - Se imponibile e IVA sono presenti, verifica che imponibile + IVA sia coerente con il totale.
@@ -709,9 +797,9 @@ def dataframe_contabilita():
     for r in st.session_state.contabilita:
         righe.append(
             {
-                "Data": r.get("data_documento", ""),
-                "Fornitore": r.get("fornitore", ""),
-                "Numero documento": r.get("numero_documento", ""),
+                "Data": r.get("data_documento", "") or "—",
+                "Fornitore": r.get("fornitore", "") or "—",
+                "Numero documento": r.get("numero_documento", "") or "—",
                 "Categoria": r.get("categoria", "Altro"),
                 "Imponibile (€)": round(parse_numero(r.get("imponibile")), 2),
                 "IVA (€)": round(parse_numero(r.get("iva")), 2),
@@ -984,8 +1072,15 @@ def risposta_contabile_python(domanda):
     # Top N fatture/documenti più costosi.
     # Gestisce anche domande composte, ad esempio:
     # "Quali sono le 2 fatture più costose e che percentuale rappresentano sul totale?"
-    top_match = re.search(r"(?:le|i)?\s*(\d+)\s+(?:fattur\w*|document\w*)\s+(?:piu|più)\s+cost", q)
-    if top_match or (any(x in q for x in ["fattura piu costosa", "fattura più costosa", "documento piu costoso", "documento più costoso"])):
+    top_match = re.search(
+        r"(?:le|i)?\s*(\d+)\s+(?:fattur\w*|document\w*|spes\w*|cost\w*|acquist\w*)\s+(?:(?:piu|più)\s+(?:costos\w*|alt\w*)|maggior\w*)",
+        q,
+    )
+    top_singolo = any(x in q for x in [
+        "fattura piu costosa", "fattura più costosa", "documento piu costoso", "documento più costoso",
+        "spesa piu alta", "spesa più alta", "spesa maggiore", "costo piu alto", "costo più alto"
+    ])
+    if top_match or top_singolo:
         n = int(top_match.group(1)) if top_match else 1
         n = max(1, min(n, 20))
         righe = df.sort_values("Totale (€)", ascending=False).head(n)
@@ -1014,7 +1109,16 @@ def risposta_contabile_python(domanda):
         if "imponibile" in q:
             elenco.append(f"- Imponibile complessivo delle {len(righe)} fatture: **{formatta_euro(imponibile_top)}**")
 
-        return risposta_python("Classifica fatture (Python)", elenco)
+        if "differenza" in q and len(righe) >= 2:
+            prima = float(righe.iloc[0]["Totale (€)"])
+            seconda = float(righe.iloc[1]["Totale (€)"])
+            diff = prima - seconda
+            elenco.append(
+                f"- Differenza tra la 1ª e la 2ª spesa: **{formatta_euro(diff)}** "
+                f"({formatta_euro(prima)} − {formatta_euro(seconda)})"
+            )
+
+        return risposta_python("Classifica spese/fatture (Python)", elenco)
 
     if any(x in q for x in ["fattura meno costosa", "fattura piu economica", "fattura più economica", "documento meno costoso"]):
         r = df.sort_values("Totale (€)").iloc[0]
