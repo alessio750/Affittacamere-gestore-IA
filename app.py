@@ -1,8 +1,11 @@
+import hashlib
 import io
+import json
 import os
 import re
 import tempfile
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 import pdfplumber
@@ -23,8 +26,11 @@ MODELLI_GEMINI = [
     "gemini-3.5-flash",
     "gemini-3.7-flash",
 ]
+
 MAX_DOCUMENTI_IA = 6
 MAX_CARATTERI_PER_DOC = 12000
+MAX_MESSAGGI_STORICO_IA = 10
+VERSIONE_APP = "2.2 - Contabilità automatica"
 
 CAMERE_DEFAULT = [
     "Baia di Budoni",
@@ -33,38 +39,67 @@ CAMERE_DEFAULT = [
     "Capo Comino",
 ]
 
+CATEGORIE_CONTABILI = [
+    "Arredi",
+    "Elettrodomestici",
+    "Biancheria",
+    "Pulizie",
+    "Manutenzione",
+    "Utenze",
+    "Telefonia/Internet",
+    "Software/Servizi online",
+    "Commissioni portali",
+    "Trasporti/Spedizioni",
+    "Materiale di consumo",
+    "Marketing/Pubblicità",
+    "Professionisti",
+    "Imposte/Tasse",
+    "Altro",
+]
+
 # =========================================================
 # MEMORIA TEMPORANEA DELLA SESSIONE
 # =========================================================
-if "prenotazioni" not in st.session_state:
-    st.session_state.prenotazioni = []
+def inizializza_sessione():
+    if "prenotazioni" not in st.session_state:
+        st.session_state.prenotazioni = []
 
-if "camere_stato" not in st.session_state:
-    st.session_state.camere_stato = {
-        camera: {"stato": "Disponibile", "ospite": "-"}
-        for camera in CAMERE_DEFAULT
-    }
-
-if "documenti_caricati" not in st.session_state:
-    st.session_state.documenti_caricati = []
-
-if "messaggi_chat" not in st.session_state:
-    st.session_state.messaggi_chat = [
-        {
-            "ruolo": "assistant",
-            "contenuto": (
-                "Ciao! 👋 Sono l'assistente IA dell'affittacamere. "
-                "Puoi farmi domande sulle camere, sulle prenotazioni e sui documenti caricati. "
-                "Puoi scrivere normalmente, proprio come con ChatGPT o Gemini."
-            ),
+    if "camere_stato" not in st.session_state:
+        st.session_state.camere_stato = {
+            camera: {"stato": "Disponibile", "ospite": "-"}
+            for camera in CAMERE_DEFAULT
         }
-    ]
 
-if "prenotazione_da_modificare" not in st.session_state:
-    st.session_state.prenotazione_da_modificare = None
+    if "documenti_caricati" not in st.session_state:
+        st.session_state.documenti_caricati = []
+
+    if "contabilita" not in st.session_state:
+        st.session_state.contabilita = []
+
+    if "messaggi_chat" not in st.session_state:
+        st.session_state.messaggi_chat = [
+            {
+                "ruolo": "assistant",
+                "contenuto": (
+                    "Ciao! 👋 Sono l'assistente IA dell'affittacamere. "
+                    "Puoi farmi domande su camere, prenotazioni, documenti e contabilità. "
+                    "I calcoli contabili principali vengono preparati da Python, mentre Gemini "
+                    "si occupa di leggere e interpretare i documenti."
+                ),
+            }
+        ]
+
+    if "prenotazione_da_modificare" not in st.session_state:
+        st.session_state.prenotazione_da_modificare = None
+
+    if "riga_contabile_da_modificare" not in st.session_state:
+        st.session_state.riga_contabile_da_modificare = None
+
+
+inizializza_sessione()
 
 # =========================================================
-# FUNZIONI UTILI
+# FUNZIONI GENERALI
 # =========================================================
 def get_gemini_client():
     api_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -79,8 +114,46 @@ def normalizza_testo(testo):
     return re.sub(r"\s+", " ", str(testo or "")).strip().lower()
 
 
+def hash_bytes(dati):
+    return hashlib.sha256(dati).hexdigest()
+
+
+def euro(valore):
+    try:
+        numero = float(valore)
+    except Exception:
+        numero = 0.0
+    return f"€ {numero:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def parse_numero(valore):
+    """Converte importi italiani/internazionali in float in modo prudente."""
+    if valore is None or valore == "":
+        return 0.0
+    if isinstance(valore, (int, float)):
+        return float(valore)
+
+    s = str(valore).strip().replace("€", "").replace(" ", "")
+    if not s:
+        return 0.0
+
+    # 1.234,56 -> 1234.56 | 1234,56 -> 1234.56 | 1,234.56 -> 1234.56
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(".", "").replace(",", ".")
+
+    s = re.sub(r"[^0-9.\-]", "", s)
+    try:
+        return float(Decimal(s))
+    except (InvalidOperation, ValueError):
+        return 0.0
+
+
 def aggiorna_stato_camere():
-    """Ricostruisce lo stato delle camere usando le prenotazioni in corso oggi."""
     oggi = date.today()
     for camera in st.session_state.camere_stato:
         st.session_state.camere_stato[camera] = {
@@ -116,9 +189,13 @@ def stato_prenotazione(prenotazione):
     except Exception:
         return "Non definita"
 
-
-def documento_gia_presente(nome, dimensione):
+# =========================================================
+# DOCUMENTI
+# =========================================================
+def documento_gia_presente(nome, dimensione, hash_file=None):
     for doc in st.session_state.documenti_caricati:
+        if hash_file and doc.get("hash") == hash_file:
+            return True
         if doc["nome"] == nome and doc.get("dimensione", 0) == dimensione:
             return True
     return False
@@ -131,17 +208,11 @@ def leggi_file_caricato(file_caricato):
 
     if estensione == "csv":
         df = pd.read_csv(io.BytesIO(bytes_file))
-        contenuto = df.to_string(index=False)
-        tipo = "CSV"
-        anteprima = df.head(20)
-        return tipo, contenuto, bytes_file, anteprima
+        return "CSV", df.to_string(index=False), bytes_file
 
     if estensione in ("xls", "xlsx"):
         df = pd.read_excel(io.BytesIO(bytes_file))
-        contenuto = df.to_string(index=False)
-        tipo = "Excel"
-        anteprima = df.head(20)
-        return tipo, contenuto, bytes_file, anteprima
+        return "Excel", df.to_string(index=False), bytes_file
 
     if estensione == "pdf":
         testo_completo = ""
@@ -154,63 +225,313 @@ def leggi_file_caricato(file_caricato):
         except Exception:
             testo_completo = ""
 
-        tipo = "PDF"
-        contenuto = testo_completo.strip()
-        return tipo, contenuto, bytes_file, None
+        return "PDF", testo_completo.strip(), bytes_file
 
     raise ValueError("Formato file non supportato.")
 
 
-def crea_contesto_gestionale(documenti_selezionati=None):
-    aggiorna_stato_camere()
-    righe = []
+def elimina_documento(indice):
+    doc = st.session_state.documenti_caricati[indice]
+    doc_hash = doc.get("hash")
+    nome = doc.get("nome")
 
-    righe.append("=== STATO CAMERE ===")
-    for camera, info in st.session_state.camere_stato.items():
-        righe.append(
-            f"- {camera}: {info['stato']} | Ospite attuale: {info['ospite']}"
+    st.session_state.contabilita = [
+        r
+        for r in st.session_state.contabilita
+        if not (
+            (doc_hash and r.get("hash_documento") == doc_hash)
+            or (not doc_hash and r.get("documento") == nome)
         )
+    ]
+    st.session_state.documenti_caricati.pop(indice)
 
-    righe.append("\n=== PRENOTAZIONI ===")
-    if st.session_state.prenotazioni:
-        for i, p in enumerate(st.session_state.prenotazioni, start=1):
-            righe.append(
-                f"{i}. {p['Ospite']} | Camera: {p['Camera']} | "
-                f"Arrivo: {p['Arrivo']} | Partenza: {p['Partenza']} | "
-                f"Prezzo: €{float(p['Prezzo (€)']):.2f} | Stato: {stato_prenotazione(p)}"
-            )
-    else:
-        righe.append("Nessuna prenotazione registrata.")
+# =========================================================
+# CONTABILITÀ AUTOMATICA
+# =========================================================
+def trova_riga_contabile_per_doc(doc):
+    doc_hash = doc.get("hash")
+    for i, riga in enumerate(st.session_state.contabilita):
+        if doc_hash and riga.get("hash_documento") == doc_hash:
+            return i
+    return None
 
-    docs = documenti_selezionati or []
-    righe.append("\n=== DOCUMENTI RILEVANTI ===")
-    if docs:
-        for doc in docs:
-            testo = doc.get("contenuto", "")
-            if testo:
-                testo = testo[:MAX_CARATTERI_PER_DOC]
-                righe.append(
-                    f"\n--- Documento: {doc['nome']} ({doc['tipo']}) ---\n{testo}"
-                )
+
+def documento_da_analizzare(doc):
+    """True solo se il documento non è mai stato analizzato con successo."""
+    if trova_riga_contabile_per_doc(doc) is not None:
+        return False
+    return not bool(doc.get("analizzato_contabilita", False))
+
+
+def estrai_json_da_testo(testo):
+    testo = str(testo or "").strip()
+    testo = re.sub(r"^```(?:json)?\s*", "", testo, flags=re.I)
+    testo = re.sub(r"\s*```$", "", testo)
+
+    match = re.search(r"\{.*\}", testo, flags=re.S)
+    if not match:
+        raise ValueError("Gemini non ha restituito un oggetto JSON leggibile.")
+    return json.loads(match.group(0))
+
+
+def prepara_file_gemini(client, doc):
+    if not doc.get("bytes"):
+        return None, None
+
+    estensione = ".pdf" if doc.get("tipo") == "PDF" else ".bin"
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=estensione)
+    temp.write(doc["bytes"])
+    temp.close()
+    uploaded = client.files.upload(file=temp.name)
+    return uploaded, temp.name
+
+
+def analizza_documento_contabile(doc):
+    """Usa Gemini una sola volta per trasformare un documento in dati contabili strutturati."""
+    client = get_gemini_client()
+
+    prompt = f"""
+Sei un estrattore di dati contabili per un affittacamere italiano.
+Analizza UN SOLO documento e restituisci ESCLUSIVAMENTE un oggetto JSON valido, senza markdown e senza commenti.
+
+Campi richiesti:
+{{
+  "e_documento_contabile": true/false,
+  "tipo_documento": "Fattura|Ricevuta|Nota di credito|Altro",
+  "fornitore": "stringa",
+  "numero_documento": "stringa",
+  "data_documento": "YYYY-MM-DD oppure stringa vuota",
+  "categoria": "una categoria dell'elenco",
+  "imponibile": 0.00,
+  "iva": 0.00,
+  "totale": 0.00,
+  "aliquota_iva": "es. 22% oppure Mista oppure stringa vuota",
+  "valuta": "EUR",
+  "note": "breve nota utile"
+}}
+
+Categorie ammesse:
+{', '.join(CATEGORIE_CONTABILI)}
+
+Regole:
+- Non inventare dati mancanti.
+- Gli importi devono essere numeri JSON, senza simbolo euro.
+- Se il documento contiene più aliquote IVA, usa aliquota_iva = "Mista".
+- Se imponibile e IVA sono presenti, verifica che imponibile + IVA sia coerente con il totale.
+- Se il documento non è una fattura/ricevuta/nota di credito o altro documento economico utile, imposta e_documento_contabile=false.
+- In caso di nota di credito, usa importi negativi se il documento rappresenta uno storno.
+
+Nome file: {doc.get('nome', '')}
+Tipo file: {doc.get('tipo', '')}
+"""
+
+    testo = doc.get("contenuto", "").strip()
+    if testo:
+        prompt += f"\nTESTO ESTRATTO DAL DOCUMENTO:\n{testo[:30000]}"
+
+    errori = []
+    for modello in MODELLI_GEMINI:
+        temp_path = None
+        try:
+            contents = [prompt]
+            # Per PDF scansionati o con testo scarso, inviamo anche il file originale.
+            if doc.get("tipo") == "PDF" and len(testo) < 150:
+                uploaded, temp_path = prepara_file_gemini(client, doc)
+                if uploaded is not None:
+                    contents.append(uploaded)
+
+            response = client.models.generate_content(model=modello, contents=contents)
+            dati = estrai_json_da_testo(getattr(response, "text", ""))
+
+            if not dati.get("e_documento_contabile", True):
+                return None, modello
+
+            categoria = str(dati.get("categoria", "Altro") or "Altro")
+            if categoria not in CATEGORIE_CONTABILI:
+                categoria = "Altro"
+
+            imponibile = round(parse_numero(dati.get("imponibile")), 2)
+            iva = round(parse_numero(dati.get("iva")), 2)
+            totale = round(parse_numero(dati.get("totale")), 2)
+
+            # Se uno dei tre campi manca ma gli altri due sono coerenti, ricaviamolo matematicamente.
+            if totale == 0 and (imponibile != 0 or iva != 0):
+                totale = round(imponibile + iva, 2)
+            elif imponibile == 0 and totale != 0 and iva != 0:
+                imponibile = round(totale - iva, 2)
+            elif iva == 0 and totale != 0 and imponibile != 0:
+                iva = round(totale - imponibile, 2)
+
+            riga = {
+                "documento": doc.get("nome", ""),
+                "hash_documento": doc.get("hash", ""),
+                "tipo_documento": str(dati.get("tipo_documento", "Altro") or "Altro"),
+                "fornitore": str(dati.get("fornitore", "") or ""),
+                "numero_documento": str(dati.get("numero_documento", "") or ""),
+                "data_documento": str(dati.get("data_documento", "") or ""),
+                "categoria": categoria,
+                "imponibile": imponibile,
+                "iva": iva,
+                "totale": totale,
+                "aliquota_iva": str(dati.get("aliquota_iva", "") or ""),
+                "valuta": str(dati.get("valuta", "EUR") or "EUR"),
+                "note": str(dati.get("note", "") or ""),
+                "estratto_con": modello,
+                "verificato": False,
+                "estratto_il": datetime.now().strftime("%d/%m/%Y %H:%M"),
+            }
+            return riga, modello
+        except Exception as e:
+            errori.append(f"{modello}: {str(e)[:180]}")
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+    raise RuntimeError(" | ".join(errori))
+
+
+def analizza_documenti_non_elaborati(documenti=None, barra=None, stato_testo=None):
+    docs = documenti if documenti is not None else st.session_state.documenti_caricati
+    da_analizzare = [d for d in docs if documento_da_analizzare(d)]
+
+    risultati = {"aggiunti": 0, "non_contabili": 0, "errori": []}
+    totale = len(da_analizzare)
+
+    for n, doc in enumerate(da_analizzare, start=1):
+        if stato_testo is not None:
+            stato_testo.write(f"Analisi {n}/{totale}: **{doc['nome']}**")
+        try:
+            riga, _ = analizza_documento_contabile(doc)
+            if riga is None:
+                doc["analizzato_contabilita"] = True
+                doc["esito_analisi"] = "Non contabile"
+                risultati["non_contabili"] += 1
             else:
-                righe.append(
-                    f"\n--- Documento: {doc['nome']} ({doc['tipo']}) ---\n"
-                    "Il PDF non contiene testo estraibile; se necessario verrà inviato direttamente a Gemini."
-                )
-    else:
-        righe.append("Nessun documento selezionato per questa domanda.")
+                st.session_state.contabilita.append(riga)
+                doc["analizzato_contabilita"] = True
+                doc["esito_analisi"] = "Inserito in Contabilità"
+                risultati["aggiunti"] += 1
+        except Exception as e:
+            risultati["errori"].append(f"{doc['nome']}: {e}")
+
+        if barra is not None and totale:
+            barra.progress(n / totale)
+
+    return risultati
+
+
+def dataframe_contabilita():
+    colonne = [
+        "Data",
+        "Fornitore",
+        "Numero documento",
+        "Categoria",
+        "Imponibile (€)",
+        "IVA (€)",
+        "Totale (€)",
+        "Aliquota IVA",
+        "Documento",
+        "Verificato",
+    ]
+    if not st.session_state.contabilita:
+        return pd.DataFrame(columns=colonne)
+
+    righe = []
+    for r in st.session_state.contabilita:
+        righe.append(
+            {
+                "Data": r.get("data_documento", ""),
+                "Fornitore": r.get("fornitore", ""),
+                "Numero documento": r.get("numero_documento", ""),
+                "Categoria": r.get("categoria", "Altro"),
+                "Imponibile (€)": round(parse_numero(r.get("imponibile")), 2),
+                "IVA (€)": round(parse_numero(r.get("iva")), 2),
+                "Totale (€)": round(parse_numero(r.get("totale")), 2),
+                "Aliquota IVA": r.get("aliquota_iva", ""),
+                "Documento": r.get("documento", ""),
+                "Verificato": "Sì" if r.get("verificato") else "No",
+            }
+        )
+    return pd.DataFrame(righe, columns=colonne)
+
+
+def riepilogo_contabile_python(righe=None):
+    righe = st.session_state.contabilita if righe is None else righe
+    imponibile = round(sum(parse_numero(r.get("imponibile")) for r in righe), 2)
+    iva = round(sum(parse_numero(r.get("iva")) for r in righe), 2)
+    totale = round(sum(parse_numero(r.get("totale")) for r in righe), 2)
+    return {
+        "numero_documenti": len(righe),
+        "imponibile": imponibile,
+        "iva": iva,
+        "totale": totale,
+    }
+
+
+def crea_testo_contabilita_per_ia():
+    if not st.session_state.contabilita:
+        return "Nessun dato contabile strutturato disponibile."
+
+    riepilogo = riepilogo_contabile_python()
+    righe = [
+        "=== CONTABILITÀ STRUTTURATA (CALCOLI ESEGUITI DA PYTHON) ===",
+        f"Numero documenti contabili: {riepilogo['numero_documenti']}",
+        f"Imponibile totale: {riepilogo['imponibile']:.2f} EUR",
+        f"IVA totale: {riepilogo['iva']:.2f} EUR",
+        f"Totale complessivo: {riepilogo['totale']:.2f} EUR",
+    ]
+
+    df = dataframe_contabilita()
+    if not df.empty:
+        per_fornitore = (
+            df.groupby("Fornitore", dropna=False)["Totale (€)"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        righe.append("\nTotali per fornitore:")
+        for nome, valore in per_fornitore.head(25).items():
+            righe.append(f"- {nome or 'Non specificato'}: {float(valore):.2f} EUR")
+
+        per_categoria = (
+            df.groupby("Categoria", dropna=False)["Totale (€)"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        righe.append("\nTotali per categoria:")
+        for nome, valore in per_categoria.items():
+            righe.append(f"- {nome}: {float(valore):.2f} EUR")
+
+        righe.append("\nDettaglio documenti:")
+        for _, r in df.tail(120).iterrows():
+            righe.append(
+                f"- {r['Data']} | {r['Fornitore']} | {r['Numero documento']} | "
+                f"{r['Categoria']} | Imponibile {r['Imponibile (€)']:.2f} | "
+                f"IVA {r['IVA (€)']:.2f} | Totale {r['Totale (€)']:.2f} EUR | "
+                f"File: {r['Documento']}"
+            )
 
     return "\n".join(righe)
 
-
+# =========================================================
+# CONTESTO E CHAT IA
+# =========================================================
 def seleziona_documenti_rilevanti(domanda):
     docs = st.session_state.documenti_caricati
     if not docs:
         return []
 
+    domanda_norm = normalizza_testo(domanda)
+
+    # Riferimenti temporali semplici: "ultima fattura", "ultimo documento".
+    if any(frase in domanda_norm for frase in ["ultima fattura", "ultimo documento", "ultimo file", "appena caricato"]):
+        return docs[-1:]
+
     parole = {
         p
-        for p in re.findall(r"[a-zA-ZÀ-ÿ0-9]+", normalizza_testo(domanda))
+        for p in re.findall(r"[a-zA-ZÀ-ÿ0-9]+", domanda_norm)
         if len(p) >= 3
     }
 
@@ -220,17 +541,14 @@ def seleziona_documenti_rilevanti(domanda):
             f"{doc.get('nome', '')} {doc.get('tipo', '')} {doc.get('contenuto', '')[:8000]}"
         )
         punteggio = sum(1 for parola in parole if parola in testo_ricerca)
-        # Un piccolo vantaggio ai documenti più recenti.
         recenza = indice / max(len(docs), 1)
         punteggi.append((punteggio + recenza * 0.05, indice, doc))
 
     punteggi.sort(key=lambda x: x[0], reverse=True)
     selezionati = [x[2] for x in punteggi[:MAX_DOCUMENTI_IA] if x[0] > 0]
 
-    # Se la domanda è generica sui documenti e nessuno ha matchato,
-    # usa gli ultimi documenti caricati.
     if not selezionati and any(
-        parola in normalizza_testo(domanda)
+        parola in domanda_norm
         for parola in ["document", "fattur", "file", "pdf", "excel", "spes", "incass"]
     ):
         selezionati = docs[-MAX_DOCUMENTI_IA:]
@@ -239,45 +557,95 @@ def seleziona_documenti_rilevanti(domanda):
 
 
 def prepara_pdf_per_gemini(client, documenti):
-    """Carica su Gemini soltanto i PDF selezionati che non hanno testo estraibile."""
     file_gemini = []
     temp_paths = []
 
     for doc in documenti:
         if doc.get("tipo") == "PDF" and not doc.get("contenuto", "").strip():
             try:
-                with tempfile.NamedTemporaryFile(
-                    delete=False, suffix=".pdf"
-                ) as temp_pdf:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
                     temp_pdf.write(doc.get("bytes", b""))
                     temp_path = temp_pdf.name
                     temp_paths.append(temp_path)
-
-                uploaded = client.files.upload(file=temp_path)
-                file_gemini.append(uploaded)
+                file_gemini.append(client.files.upload(file=temp_path))
             except Exception:
                 pass
 
     return file_gemini, temp_paths
 
 
+def crea_contesto_gestionale(documenti_selezionati=None):
+    aggiorna_stato_camere()
+    righe = []
+
+    righe.append("=== STATO CAMERE ===")
+    for camera, info in st.session_state.camere_stato.items():
+        righe.append(f"- {camera}: {info['stato']} | Ospite attuale: {info['ospite']}")
+
+    righe.append("\n=== PRENOTAZIONI ===")
+    if st.session_state.prenotazioni:
+        for i, p in enumerate(st.session_state.prenotazioni, start=1):
+            righe.append(
+                f"{i}. {p['Ospite']} | Camera: {p['Camera']} | Arrivo: {p['Arrivo']} | "
+                f"Partenza: {p['Partenza']} | Prezzo: {float(p['Prezzo (€)']):.2f} EUR | "
+                f"Stato: {stato_prenotazione(p)}"
+            )
+    else:
+        righe.append("Nessuna prenotazione registrata.")
+
+    righe.append("\n" + crea_testo_contabilita_per_ia())
+
+    docs = documenti_selezionati or []
+    righe.append("\n=== DOCUMENTI RILEVANTI PER LA DOMANDA ===")
+    if docs:
+        for doc in docs:
+            testo = doc.get("contenuto", "")
+            if testo:
+                righe.append(
+                    f"\n--- Documento: {doc['nome']} ({doc['tipo']}) ---\n"
+                    f"{testo[:MAX_CARATTERI_PER_DOC]}"
+                )
+            else:
+                righe.append(
+                    f"\n--- Documento: {doc['nome']} ({doc['tipo']}) ---\n"
+                    "PDF senza testo estraibile: può essere allegato direttamente a Gemini."
+                )
+    else:
+        righe.append("Nessun documento specifico selezionato per questa domanda.")
+
+    return "\n".join(righe)
+
+
+def storico_chat_per_ia():
+    messaggi = st.session_state.messaggi_chat[-MAX_MESSAGGI_STORICO_IA:]
+    righe = []
+    for m in messaggi:
+        ruolo = "UTENTE" if m.get("ruolo") == "user" else "ASSISTENTE"
+        righe.append(f"{ruolo}: {str(m.get('contenuto', ''))[:2500]}")
+    return "\n".join(righe)
+
+
 def invia_a_gemini(domanda):
     documenti = seleziona_documenti_rilevanti(domanda)
     contesto = crea_contesto_gestionale(documenti)
+    storico = storico_chat_per_ia()
 
     istruzioni = f"""
-Sei l'assistente amministrativo e gestionale di un affittacamere italiano.
+Sei l'assistente amministrativo, gestionale e finanziario di un affittacamere italiano.
 Rispondi sempre in italiano, in modo chiaro, pratico e professionale.
 
 REGOLE IMPORTANTI:
-- Usa i dati del contesto qui sotto e gli eventuali PDF allegati.
+- Usa i dati del contesto e gli eventuali PDF allegati.
 - Non inventare nomi, importi, prenotazioni, fatture o dati mancanti.
 - Se un dato non è disponibile, dillo chiaramente.
-- Per somme, confronti e calcoli mostra il risultato in modo semplice.
-- Se analizzi fatture o spese, evidenzia importi, scadenze, fornitori e possibili anomalie quando presenti.
+- I numeri presenti nella sezione CONTABILITÀ STRUTTURATA sono già stati calcolati da Python: per totali, IVA, imponibile, fornitori e categorie preferisci SEMPRE quei valori ai calcoli fatti mentalmente.
+- Se l'utente chiede il dettaglio di una singola fattura, puoi usare il documento originale selezionato.
+- Se trovi una possibile incoerenza tra documento originale e tabella contabile, segnalala invece di nasconderla.
 - Puoi dare suggerimenti gestionali, ma non presentare consulenza fiscale o legale come definitiva.
-- Se la domanda dell'utente è generale, puoi rispondere normalmente anche senza usare documenti.
-- Non dire di aver letto documenti che non sono presenti nel contesto o allegati.
+- Mantieni il filo della conversazione usando lo storico recente quando è utile.
+
+STORICO RECENTE DELLA CHAT:
+{storico}
 
 CONTESTO GESTIONALE:
 {contesto}
@@ -294,10 +662,7 @@ DOMANDA DELL'UTENTE:
         try:
             file_gemini, temp_paths = prepara_pdf_per_gemini(client, documenti)
             contents = [istruzioni] + file_gemini
-            response = client.models.generate_content(
-                model=modello,
-                contents=contents,
-            )
+            response = client.models.generate_content(model=modello, contents=contents)
             testo = getattr(response, "text", None)
             if testo:
                 return testo, modello
@@ -316,7 +681,9 @@ DOMANDA DELL'UTENTE:
         "Riprova tra poco. Dettaglio tecnico: " + " | ".join(errori)
     )
 
-
+# =========================================================
+# BACKUP EXCEL
+# =========================================================
 def genera_backup_excel():
     output = io.BytesIO()
     aggiorna_stato_camere()
@@ -345,31 +712,45 @@ def genera_backup_excel():
                 "Tipo": doc["tipo"],
                 "Dimensione (KB)": round(doc.get("dimensione", 0) / 1024, 2),
                 "Caricato il": doc.get("caricato_il", ""),
+                "Elaborato contabilità": "Sì" if trova_riga_contabile_per_doc(doc) is not None else "No",
             }
             for doc in st.session_state.documenti_caricati
         ]
     )
 
+    df_contabilita = dataframe_contabilita()
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         if df_prenotazioni.empty:
-            pd.DataFrame(columns=["Ospite", "Camera", "Arrivo", "Partenza", "Prezzo (€)", "Stato"]).to_excel(
-                writer, sheet_name="Prenotazioni", index=False
-            )
+            pd.DataFrame(
+                columns=["Ospite", "Camera", "Arrivo", "Partenza", "Prezzo (€)", "Stato"]
+            ).to_excel(writer, sheet_name="Prenotazioni", index=False)
         else:
             df_prenotazioni.to_excel(writer, sheet_name="Prenotazioni", index=False)
 
         df_camere.to_excel(writer, sheet_name="Stato camere", index=False)
 
         if df_documenti.empty:
-            pd.DataFrame(columns=["Nome file", "Tipo", "Dimensione (KB)", "Caricato il"]).to_excel(
-                writer, sheet_name="Archivio documenti", index=False
-            )
+            pd.DataFrame(
+                columns=["Nome file", "Tipo", "Dimensione (KB)", "Caricato il", "Elaborato contabilità"]
+            ).to_excel(writer, sheet_name="Archivio documenti", index=False)
         else:
             df_documenti.to_excel(writer, sheet_name="Archivio documenti", index=False)
 
+        df_contabilita.to_excel(writer, sheet_name="Contabilita", index=False)
+
+        riepilogo = riepilogo_contabile_python()
+        pd.DataFrame(
+            [
+                {"Voce": "Numero documenti", "Valore": riepilogo["numero_documenti"]},
+                {"Voce": "Imponibile totale", "Valore": riepilogo["imponibile"]},
+                {"Voce": "IVA totale", "Valore": riepilogo["iva"]},
+                {"Voce": "Totale complessivo", "Valore": riepilogo["totale"]},
+            ]
+        ).to_excel(writer, sheet_name="Riepilogo contabile", index=False)
+
     output.seek(0)
     return output.getvalue()
-
 
 # =========================================================
 # TESTATA E MENU
@@ -377,7 +758,9 @@ def genera_backup_excel():
 aggiorna_stato_camere()
 
 st.title("🛏️ Sistema Gestione Affittacamere con IA")
-st.write("Gestionale completo con archivio documenti, prenotazioni e assistente IA.")
+st.write("Gestionale con archivio documenti, contabilità automatica, prenotazioni e assistente IA.")
+
+st.sidebar.caption(f"Versione: {VERSIONE_APP}")
 
 menu = st.sidebar.selectbox(
     "Menu di Navigazione",
@@ -386,6 +769,7 @@ menu = st.sidebar.selectbox(
         "➕ Nuova Prenotazione",
         "📋 Elenco Prenotazioni",
         "📂 Archivio e Analisi File",
+        "📊 Contabilità",
         "💾 Backup Dati",
         "💬 Chat IA Assistente",
     ],
@@ -400,19 +784,13 @@ if menu == "🏠 Panoramica Camere":
     st.header("Stato Attuale delle Camere")
 
     dati_tabella = [
-        {
-            "Camera": camera,
-            "Stato": info["stato"],
-            "Ospite Attuale": info["ospite"],
-        }
+        {"Camera": camera, "Stato": info["stato"], "Ospite Attuale": info["ospite"]}
         for camera, info in st.session_state.camere_stato.items()
     ]
     st.dataframe(pd.DataFrame(dati_tabella), use_container_width=True, hide_index=True)
 
     col1, col2, col3 = st.columns(3)
-    disponibili = sum(
-        1 for x in st.session_state.camere_stato.values() if x["stato"] == "Disponibile"
-    )
+    disponibili = sum(1 for x in st.session_state.camere_stato.values() if x["stato"] == "Disponibile")
     occupate = len(st.session_state.camere_stato) - disponibili
     col1.metric("Camere totali", len(st.session_state.camere_stato))
     col2.metric("Disponibili", disponibili)
@@ -426,14 +804,10 @@ elif menu == "➕ Nuova Prenotazione":
 
     with st.form("form_prenotazione", clear_on_submit=True):
         nome_ospite = st.text_input("Nome e Cognome Ospite")
-        camera_scelta = st.selectbox(
-            "Seleziona Camera", list(st.session_state.camere_stato.keys())
-        )
+        camera_scelta = st.selectbox("Seleziona Camera", list(st.session_state.camere_stato.keys()))
         data_arrivo = st.date_input("Data di Arrivo")
         data_partenza = st.date_input("Data di Partenza")
-        prezzo_totale = st.number_input(
-            "Prezzo Totale (€)", min_value=0.0, format="%.2f"
-        )
+        prezzo_totale = st.number_input("Prezzo Totale (€)", min_value=0.0, format="%.2f")
         pulsante_salva = st.form_submit_button("Salva e Registra Prenotazione")
 
     if pulsante_salva:
@@ -465,16 +839,11 @@ elif menu == "📋 Elenco Prenotazioni":
     else:
         col1, col2, col3 = st.columns([2, 1, 1])
         ricerca = col1.text_input("🔎 Cerca ospite", placeholder="Es. Mario Rossi")
-        filtro_stato = col2.selectbox(
-            "Stato", ["Tutte", "Attiva", "Futura", "Terminata"]
-        )
-        filtro_camera = col3.selectbox(
-            "Camera", ["Tutte"] + list(st.session_state.camere_stato.keys())
-        )
+        filtro_stato = col2.selectbox("Stato", ["Tutte", "Attiva", "Futura", "Terminata"])
+        filtro_camera = col3.selectbox("Camera", ["Tutte"] + list(st.session_state.camere_stato.keys()))
 
         righe = []
-        indici_visibili = []
-        for indice, p in enumerate(st.session_state.prenotazioni):
+        for p in st.session_state.prenotazioni:
             stato = stato_prenotazione(p)
             if ricerca and ricerca.lower() not in p["Ospite"].lower():
                 continue
@@ -482,11 +851,9 @@ elif menu == "📋 Elenco Prenotazioni":
                 continue
             if filtro_camera != "Tutte" and p["Camera"] != filtro_camera:
                 continue
-
             riga = dict(p)
             riga["Stato"] = stato
             righe.append(riga)
-            indici_visibili.append(indice)
 
         if righe:
             st.dataframe(pd.DataFrame(righe), use_container_width=True, hide_index=True)
@@ -500,7 +867,6 @@ elif menu == "📋 Elenco Prenotazioni":
         }
         scelta = st.selectbox("Seleziona prenotazione", list(opzioni.keys()))
         indice_scelto = opzioni[scelta]
-        p = st.session_state.prenotazioni[indice_scelto]
 
         col_mod, col_del = st.columns(2)
         if col_mod.button("✏️ Modifica prenotazione", use_container_width=True):
@@ -521,22 +887,12 @@ elif menu == "📋 Elenco Prenotazioni":
                 with st.form("form_modifica_prenotazione"):
                     nuovo_nome = st.text_input("Nome e Cognome", value=corrente["Ospite"])
                     camere = list(st.session_state.camere_stato.keys())
-                    nuova_camera = st.selectbox(
-                        "Camera",
-                        camere,
-                        index=camere.index(corrente["Camera"]),
-                    )
-                    nuovo_arrivo = st.date_input(
-                        "Arrivo", value=pd.to_datetime(corrente["Arrivo"]).date()
-                    )
-                    nuova_partenza = st.date_input(
-                        "Partenza", value=pd.to_datetime(corrente["Partenza"]).date()
-                    )
+                    nuova_camera = st.selectbox("Camera", camere, index=camere.index(corrente["Camera"]))
+                    nuovo_arrivo = st.date_input("Arrivo", value=pd.to_datetime(corrente["Arrivo"]).date())
+                    nuova_partenza = st.date_input("Partenza", value=pd.to_datetime(corrente["Partenza"]).date())
                     nuovo_prezzo = st.number_input(
-                        "Prezzo Totale (€)",
-                        min_value=0.0,
-                        value=float(corrente["Prezzo (€)"]),
-                        format="%.2f",
+                        "Prezzo Totale (€)", min_value=0.0,
+                        value=float(corrente["Prezzo (€)"]), format="%.2f"
                     )
                     salva_modifica = st.form_submit_button("💾 Salva modifiche")
 
@@ -564,8 +920,8 @@ elif menu == "📋 Elenco Prenotazioni":
 elif menu == "📂 Archivio e Analisi File":
     st.header("Archivio e Analisi File")
     st.info(
-        "Puoi selezionare molti file insieme. L'app accetta CSV, Excel e PDF. "
-        "I documenti restano nella memoria temporanea della sessione."
+        "Puoi selezionare molti file insieme. Dopo il caricamento puoi farli elaborare dalla "
+        "contabilità automatica: Gemini li legge una volta e Python userà poi i valori estratti per i calcoli."
     )
 
     files_caricati = st.file_uploader(
@@ -574,6 +930,7 @@ elif menu == "📂 Archivio e Analisi File":
         accept_multiple_files=True,
     )
 
+    nuovi_doc = []
     if files_caricati:
         aggiunti = 0
         duplicati = 0
@@ -582,21 +939,26 @@ elif menu == "📂 Archivio e Analisi File":
 
         for numero, file_caricato in enumerate(files_caricati, start=1):
             try:
-                dimensione = len(file_caricato.getvalue())
-                if documento_gia_presente(file_caricato.name, dimensione):
+                bytes_originali = file_caricato.getvalue()
+                dimensione = len(bytes_originali)
+                impronta = hash_bytes(bytes_originali)
+                if documento_gia_presente(file_caricato.name, dimensione, impronta):
                     duplicati += 1
                 else:
-                    tipo, contenuto, bytes_file, _ = leggi_file_caricato(file_caricato)
-                    st.session_state.documenti_caricati.append(
-                        {
-                            "nome": file_caricato.name,
-                            "tipo": tipo,
-                            "contenuto": contenuto,
-                            "bytes": bytes_file,
-                            "dimensione": dimensione,
-                            "caricato_il": datetime.now().strftime("%d/%m/%Y %H:%M"),
-                        }
-                    )
+                    tipo, contenuto, bytes_file = leggi_file_caricato(file_caricato)
+                    doc = {
+                        "nome": file_caricato.name,
+                        "tipo": tipo,
+                        "contenuto": contenuto,
+                        "bytes": bytes_file,
+                        "dimensione": dimensione,
+                        "hash": impronta,
+                        "caricato_il": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                        "analizzato_contabilita": False,
+                        "esito_analisi": "Da analizzare",
+                    }
+                    st.session_state.documenti_caricati.append(doc)
+                    nuovi_doc.append(doc)
                     aggiunti += 1
             except Exception as e:
                 errori.append(f"{file_caricato.name}: {e}")
@@ -614,21 +976,64 @@ elif menu == "📂 Archivio e Analisi File":
 
     st.divider()
 
+    # CASSELLA BEN VISIBILE PER L'ANALISI CONTABILE
+    da_elaborare = [d for d in st.session_state.documenti_caricati if documento_da_analizzare(d)]
+    gia_elaborati = len(st.session_state.documenti_caricati) - len(da_elaborare)
+
+    with st.container(border=True):
+        st.subheader("🤖 Analisi contabile automatica")
+        st.write(
+            "Dopo aver caricato le fatture, premi il pulsante qui sotto. "
+            "Gemini leggerà **solo i documenti nuovi**, estrarrà i dati contabili e li passerà alla pagina **📊 Contabilità**."
+        )
+        c_a, c_b, c_c = st.columns(3)
+        c_a.metric("Da analizzare", len(da_elaborare))
+        c_b.metric("Già analizzati", gia_elaborati)
+        c_c.metric("Righe in Contabilità", len(st.session_state.contabilita))
+
+        avvia_analisi = st.button(
+            "🤖 ANALIZZA I NUOVI FILE",
+            type="primary",
+            use_container_width=True,
+            disabled=len(da_elaborare) == 0,
+        )
+
+        if len(da_elaborare) == 0 and st.session_state.documenti_caricati:
+            st.success("✅ Tutti i documenti presenti sono già stati analizzati.")
+        elif len(da_elaborare) > 0:
+            st.caption(
+                f"Verranno analizzati {len(da_elaborare)} file. Durante l'operazione vedrai l'avanzamento documento per documento."
+            )
+
+    if avvia_analisi:
+        st.info("Analisi in corso: non chiudere la pagina fino al completamento.")
+        barra_ia = st.progress(0)
+        stato_ia = st.empty()
+        risultati = analizza_documenti_non_elaborati(barra=barra_ia, stato_testo=stato_ia)
+        stato_ia.empty()
+        barra_ia.empty()
+        if risultati["aggiunti"]:
+            st.success(f"✅ {risultati['aggiunti']} fatture/documenti aggiunti alla pagina Contabilità.")
+        if risultati["non_contabili"]:
+            st.info(f"ℹ️ {risultati['non_contabili']} file sono stati letti ma non riconosciuti come documenti contabili.")
+        if risultati["errori"]:
+            st.warning(f"⚠️ {len(risultati['errori'])} documenti non sono stati elaborati e potranno essere riprovati.")
+            with st.expander("Mostra errori di analisi"):
+                for errore in risultati["errori"]:
+                    st.write(f"- {errore}")
+        st.rerun()
+
     col1, col2, col3 = st.columns([1, 1, 2])
     col1.metric("Documenti", len(st.session_state.documenti_caricati))
-    spazio_mb = sum(
-        doc.get("dimensione", 0) for doc in st.session_state.documenti_caricati
-    ) / (1024 * 1024)
+    spazio_mb = sum(doc.get("dimensione", 0) for doc in st.session_state.documenti_caricati) / (1024 * 1024)
     col2.metric("Dimensione sessione", f"{spazio_mb:.1f} MB")
-
-    ricerca_doc = col3.text_input(
-        "🔎 Cerca nell'archivio", placeholder="Nome file, fattura, fornitore..."
-    )
+    ricerca_doc = col3.text_input("🔎 Cerca nell'archivio", placeholder="Nome file, fattura, fornitore...")
 
     if st.session_state.documenti_caricati:
         if st.button("🧹 Svuota tutto l'archivio", type="secondary"):
             st.session_state.documenti_caricati = []
-            st.success("Archivio svuotato.")
+            st.session_state.contabilita = []
+            st.success("Archivio e relativa contabilità svuotati.")
             st.rerun()
 
         st.subheader("Documenti caricati")
@@ -642,46 +1047,200 @@ elif menu == "📂 Archivio e Analisi File":
                 continue
 
             with st.container(border=True):
-                c1, c2, c3, c4 = st.columns([4, 1, 1, 1])
+                c1, c2, c3 = st.columns([5, 1, 1])
+                elaborato = trova_riga_contabile_per_doc(doc) is not None
+                if elaborato:
+                    badge = " • ✅ Contabilità"
+                elif doc.get("analizzato_contabilita", False):
+                    badge = " • ℹ️ Analizzato (non contabile)"
+                else:
+                    badge = " • ⏳ Da analizzare"
                 c1.markdown(f"**📄 {doc['nome']}**")
                 c1.caption(
                     f"{doc['tipo']} • {doc.get('dimensione', 0) / 1024:.1f} KB • "
-                    f"{doc.get('caricato_il', '')}"
+                    f"{doc.get('caricato_il', '')}{badge}"
                 )
 
                 if c2.button("👁️ Anteprima", key=f"preview_{indice}"):
-                    st.session_state[f"mostra_doc_{indice}"] = not st.session_state.get(
-                        f"mostra_doc_{indice}", False
-                    )
+                    st.session_state[f"mostra_doc_{indice}"] = not st.session_state.get(f"mostra_doc_{indice}", False)
 
                 if c3.button("🗑️ Elimina", key=f"delete_{indice}"):
-                    st.session_state.documenti_caricati.pop(indice)
+                    elimina_documento(indice)
                     st.success(f"Eliminato: {doc['nome']}")
                     st.rerun()
-
-                c4.write("")
 
                 if st.session_state.get(f"mostra_doc_{indice}", False):
                     if doc.get("contenuto"):
                         st.text_area(
-                            "Contenuto estratto",
-                            doc["contenuto"][:12000],
-                            height=220,
-                            key=f"testo_{indice}",
+                            "Contenuto estratto", doc["contenuto"][:12000],
+                            height=220, key=f"testo_{indice}"
                         )
                     else:
                         st.info(
-                            "Questo PDF non contiene testo estraibile. "
-                            "La Chat IA può comunque provare a leggerlo direttamente quando è rilevante."
+                            "Questo PDF non contiene testo estraibile. Gemini può comunque leggerlo "
+                            "direttamente durante l'analisi contabile o quando è rilevante in chat."
                         )
     else:
         st.info("L'archivio è vuoto.")
 
     st.caption(
-        "Nota: il caricamento multiplo permette di gestire molti documenti, ma Streamlit Cloud "
-        "ha comunque limiti di memoria. Per un archivio realmente permanente e molto grande, "
-        "in una fase successiva collegheremo un database/storage."
+        "Per molti documenti è meglio caricarli a gruppi e poi premere 'Analizza nuovi file'. "
+        "L'analisi usa una chiamata IA per documento non ancora elaborato; in seguito i totali vengono calcolati da Python."
     )
+
+# =========================================================
+# CONTABILITÀ
+# =========================================================
+elif menu == "📊 Contabilità":
+    st.header("📊 Contabilità automatica")
+    st.write(
+        "Qui trovi i dati estratti dalle fatture. Gemini interpreta ogni documento una volta; "
+        "imponibile, IVA e totale vengono poi sommati matematicamente da Python."
+    )
+
+    if not st.session_state.contabilita:
+        st.info(
+            "Non ci sono ancora dati contabili. Vai in **📂 Archivio e Analisi File**, carica le fatture "
+            "e premi **🤖 Analizza nuovi file**."
+        )
+    else:
+        df = dataframe_contabilita()
+
+        c1, c2, c3, c4 = st.columns(4)
+        riepilogo = riepilogo_contabile_python()
+        c1.metric("Documenti contabili", riepilogo["numero_documenti"])
+        c2.metric("Imponibile totale", euro(riepilogo["imponibile"]))
+        c3.metric("IVA totale", euro(riepilogo["iva"]))
+        c4.metric("Totale spese", euro(riepilogo["totale"]))
+
+        st.caption(
+            "🧮 I quattro valori qui sopra sono calcolati da Python sui dati estratti, non generati liberamente dall'IA."
+        )
+
+        st.divider()
+        f1, f2, f3 = st.columns([2, 1, 1])
+        cerca_fornitore = f1.text_input("🔎 Cerca fornitore/documento", placeholder="Es. IKEA")
+        categorie_presenti = sorted({r.get("categoria", "Altro") for r in st.session_state.contabilita})
+        filtro_categoria = f2.selectbox("Categoria", ["Tutte"] + categorie_presenti)
+        filtro_verifica = f3.selectbox("Verifica", ["Tutti", "Verificati", "Da verificare"])
+
+        indici_filtrati = []
+        righe_filtrate = []
+        ricerca_norm = normalizza_testo(cerca_fornitore)
+        for i, r in enumerate(st.session_state.contabilita):
+            testo = normalizza_testo(
+                f"{r.get('fornitore','')} {r.get('documento','')} {r.get('numero_documento','')}"
+            )
+            if ricerca_norm and ricerca_norm not in testo:
+                continue
+            if filtro_categoria != "Tutte" and r.get("categoria") != filtro_categoria:
+                continue
+            if filtro_verifica == "Verificati" and not r.get("verificato"):
+                continue
+            if filtro_verifica == "Da verificare" and r.get("verificato"):
+                continue
+            indici_filtrati.append(i)
+            righe_filtrate.append(r)
+
+        if righe_filtrate:
+            df_filtro = dataframe_contabilita().iloc[indici_filtrati].reset_index(drop=True)
+            st.dataframe(
+                df_filtro,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Imponibile (€)": st.column_config.NumberColumn(format="€ %.2f"),
+                    "IVA (€)": st.column_config.NumberColumn(format="€ %.2f"),
+                    "Totale (€)": st.column_config.NumberColumn(format="€ %.2f"),
+                },
+            )
+
+            r_filtro = riepilogo_contabile_python(righe_filtrate)
+            st.caption(
+                f"Totale filtrato: **{euro(r_filtro['totale'])}** • IVA: **{euro(r_filtro['iva'])}** • "
+                f"Imponibile: **{euro(r_filtro['imponibile'])}**"
+            )
+        else:
+            st.info("Nessuna riga corrisponde ai filtri selezionati.")
+
+        st.divider()
+        col_sx, col_dx = st.columns(2)
+
+        with col_sx:
+            st.subheader("Spesa per fornitore")
+            per_fornitore = (
+                df.groupby("Fornitore", dropna=False)["Totale (€)"]
+                .sum()
+                .sort_values(ascending=False)
+                .reset_index()
+            )
+            st.dataframe(per_fornitore, use_container_width=True, hide_index=True)
+
+        with col_dx:
+            st.subheader("Spesa per categoria")
+            per_categoria = (
+                df.groupby("Categoria", dropna=False)["Totale (€)"]
+                .sum()
+                .sort_values(ascending=False)
+                .reset_index()
+            )
+            st.dataframe(per_categoria, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("✏️ Controlla, correggi o elimina una riga")
+
+        opzioni = {
+            f"{i+1}. {r.get('fornitore') or 'Fornitore non indicato'} — {r.get('documento')} — {euro(r.get('totale'))}": i
+            for i, r in enumerate(st.session_state.contabilita)
+        }
+        selezione = st.selectbox("Seleziona documento contabile", list(opzioni.keys()))
+        idx = opzioni[selezione]
+        corrente = st.session_state.contabilita[idx]
+
+        with st.form("form_modifica_contabilita"):
+            m1, m2 = st.columns(2)
+            fornitore = m1.text_input("Fornitore", value=corrente.get("fornitore", ""))
+            numero_doc = m2.text_input("Numero documento", value=corrente.get("numero_documento", ""))
+            data_doc = m1.text_input("Data documento (YYYY-MM-DD)", value=corrente.get("data_documento", ""))
+            cat_attuale = corrente.get("categoria", "Altro")
+            categoria = m2.selectbox(
+                "Categoria", CATEGORIE_CONTABILI,
+                index=CATEGORIE_CONTABILI.index(cat_attuale) if cat_attuale in CATEGORIE_CONTABILI else CATEGORIE_CONTABILI.index("Altro")
+            )
+            imponibile = m1.number_input("Imponibile (€)", value=float(corrente.get("imponibile", 0.0)), format="%.2f")
+            iva = m2.number_input("IVA (€)", value=float(corrente.get("iva", 0.0)), format="%.2f")
+            totale = m1.number_input("Totale (€)", value=float(corrente.get("totale", 0.0)), format="%.2f")
+            aliquota = m2.text_input("Aliquota IVA", value=corrente.get("aliquota_iva", ""))
+            note = st.text_area("Note", value=corrente.get("note", ""))
+            verificato = st.checkbox(
+                "✅ Ho verificato i valori confrontandoli con il documento originale",
+                value=bool(corrente.get("verificato", False)),
+            )
+            salva = st.form_submit_button("💾 Salva correzioni", use_container_width=True)
+
+        if salva:
+            corrente.update(
+                {
+                    "fornitore": fornitore.strip(),
+                    "numero_documento": numero_doc.strip(),
+                    "data_documento": data_doc.strip(),
+                    "categoria": categoria,
+                    "imponibile": round(float(imponibile), 2),
+                    "iva": round(float(iva), 2),
+                    "totale": round(float(totale), 2),
+                    "aliquota_iva": aliquota.strip(),
+                    "note": note.strip(),
+                    "verificato": verificato,
+                }
+            )
+            st.session_state.contabilita[idx] = corrente
+            st.success("Dati contabili aggiornati.")
+            st.rerun()
+
+        if st.button("🗑️ Elimina solo questa riga contabile", type="secondary"):
+            st.session_state.contabilita.pop(idx)
+            st.success("Riga contabile eliminata. Il file originale resta nell'Archivio e potrà essere rianalizzato.")
+            st.rerun()
 
 # =========================================================
 # BACKUP
@@ -689,7 +1248,7 @@ elif menu == "📂 Archivio e Analisi File":
 elif menu == "💾 Backup Dati":
     st.header("Backup ed esportazione")
     st.write(
-        "Scarica un file Excel con le prenotazioni, lo stato delle camere e l'elenco dei documenti caricati."
+        "Scarica un Excel con prenotazioni, stato camere, archivio documenti, contabilità e riepilogo contabile."
     )
 
     backup = genera_backup_excel()
@@ -704,8 +1263,8 @@ elif menu == "💾 Backup Dati":
     )
 
     st.caption(
-        "Il backup contiene l'elenco dei documenti, ma non incorpora i PDF/Excel originali. "
-        "I file originali restano nella sessione temporanea dell'app."
+        "Il backup contiene i dati estratti e l'elenco dei documenti, ma non incorpora i PDF/Excel originali. "
+        "I file originali restano nella memoria temporanea della sessione."
     )
 
 # =========================================================
@@ -714,7 +1273,8 @@ elif menu == "💾 Backup Dati":
 elif menu == "💬 Chat IA Assistente":
     st.header("Assistente Virtuale IA dell'Affittacamere")
     st.write(
-        "Chiedi qualsiasi cosa su camere, prenotazioni, incassi, spese, Excel e fatture caricate."
+        "Chiedi qualsiasi cosa su camere, prenotazioni, incassi, spese, Excel, fatture e contabilità. "
+        "Per i totali contabili l'IA riceve già i risultati calcolati da Python."
     )
 
     for messaggio in st.session_state.messaggi_chat:
@@ -724,9 +1284,7 @@ elif menu == "💬 Chat IA Assistente":
     input_utente = st.chat_input("Scrivi qui la tua domanda...")
 
     if input_utente:
-        st.session_state.messaggi_chat.append(
-            {"ruolo": "user", "contenuto": input_utente}
-        )
+        st.session_state.messaggi_chat.append({"ruolo": "user", "contenuto": input_utente})
         with st.chat_message("user"):
             st.markdown(input_utente)
 
@@ -735,16 +1293,13 @@ elif menu == "💬 Chat IA Assistente":
                 try:
                     risposta, modello_usato = invia_a_gemini(input_utente)
                     st.markdown(risposta)
-                    st.caption(f"IA: {modello_usato}")
+                    st.caption(f"IA: {modello_usato} • Totali contabili: Python")
                 except Exception as e:
                     risposta = (
                         "❌ In questo momento Gemini non riesce a rispondere. "
-                        "La tua chiave può essere corretta: potrebbe trattarsi di un sovraccarico "
-                        "temporaneo o di un limite API. Riprova tra poco.\n\n"
+                        "Potrebbe trattarsi di un sovraccarico temporaneo o di un limite API. Riprova tra poco.\n\n"
                         f"Dettaglio: `{str(e)}`"
                     )
                     st.error(risposta)
 
-        st.session_state.messaggi_chat.append(
-            {"ruolo": "assistant", "contenuto": risposta}
-        )
+        st.session_state.messaggi_chat.append({"ruolo": "assistant", "contenuto": risposta})
