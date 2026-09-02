@@ -7,7 +7,7 @@ import re
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import pandas as pd
@@ -77,7 +77,7 @@ MODELLI_GEMINI = [
 MAX_DOCUMENTI_IA = 6
 MAX_CARATTERI_PER_DOC = 12000
 MAX_MESSAGGI_STORICO_IA = 10
-VERSIONE_APP = "2.9 - Accesso protetto + motore 2.8"
+VERSIONE_APP = "2.10 - Cambio biancheria automatico + motore 2.9"
 MAX_ANALISI_PARALLELE = 2
 GEMINI_TIMEOUT_ESTRAZIONE_MS = 25000
 MODELLI_ESTRAZIONE_GEMINI = MODELLI_GEMINI[:2]
@@ -141,6 +141,9 @@ def inizializza_sessione():
 
     if "prenotazione_da_modificare" not in st.session_state:
         st.session_state.prenotazione_da_modificare = None
+
+    if "cambi_biancheria_effettuati" not in st.session_state:
+        st.session_state.cambi_biancheria_effettuati = set()
 
     if "riga_contabile_da_modificare" not in st.session_state:
         st.session_state.riga_contabile_da_modificare = None
@@ -240,6 +243,67 @@ def stato_prenotazione(prenotazione):
         return "Terminata"
     except Exception:
         return "Non definita"
+
+
+def chiave_cambio_biancheria(prenotazione, data_cambio):
+    """Chiave stabile nella sessione per segnare un cambio come effettuato."""
+    return "|".join([
+        str(prenotazione.get("Ospite", "")),
+        str(prenotazione.get("Camera", "")),
+        str(prenotazione.get("Arrivo", "")),
+        str(prenotazione.get("Partenza", "")),
+        str(data_cambio),
+    ])
+
+
+def date_cambio_biancheria(prenotazione):
+    """Restituisce i cambi: primo al 4° giorno (arrivo + 3), poi ogni 4 giorni, prima del check-out."""
+    try:
+        arrivo = pd.to_datetime(prenotazione["Arrivo"]).date()
+        partenza = pd.to_datetime(prenotazione["Partenza"]).date()
+    except Exception:
+        return []
+
+    cambi = []
+    data_cambio = arrivo + timedelta(days=3)
+    while data_cambio < partenza:
+        cambi.append(data_cambio)
+        data_cambio += timedelta(days=4)
+    return cambi
+
+
+def righe_cambio_biancheria():
+    """Crea l'agenda biancheria direttamente dalle prenotazioni correnti."""
+    oggi = date.today()
+    righe = []
+    effettuati = st.session_state.cambi_biancheria_effettuati
+
+    for indice, p in enumerate(st.session_state.prenotazioni):
+        for data_cambio in date_cambio_biancheria(p):
+            chiave = chiave_cambio_biancheria(p, data_cambio)
+            fatto = chiave in effettuati
+            if fatto:
+                stato = "✅ Effettuato"
+            elif data_cambio < oggi:
+                stato = "🔴 In ritardo"
+            elif data_cambio == oggi:
+                stato = "🟠 Da fare oggi"
+            else:
+                stato = "🟢 Programmato"
+
+            righe.append({
+                "indice_prenotazione": indice,
+                "chiave": chiave,
+                "Camera": p.get("Camera", ""),
+                "Ospite": p.get("Ospite", ""),
+                "Arrivo": p.get("Arrivo", ""),
+                "Partenza": p.get("Partenza", ""),
+                "Data cambio": data_cambio,
+                "Stato": stato,
+                "effettuato": fatto,
+            })
+
+    return sorted(righe, key=lambda r: (r["Data cambio"], r["Camera"], r["Ospite"]))
 
 # =========================================================
 # DOCUMENTI
@@ -1469,6 +1533,7 @@ menu = st.sidebar.selectbox(
         "🏠 Panoramica Camere",
         "➕ Nuova Prenotazione",
         "📋 Elenco Prenotazioni",
+        "🧺 Cambio Biancheria",
         "📂 Archivio e Analisi File",
         "📊 Contabilità",
         "💾 Backup Dati",
@@ -1614,6 +1679,99 @@ elif menu == "📋 Elenco Prenotazioni":
                         aggiorna_stato_camere()
                         st.success("Prenotazione aggiornata.")
                         st.rerun()
+
+# =========================================================
+# CAMBIO BIANCHERIA
+# =========================================================
+elif menu == "🧺 Cambio Biancheria":
+    st.header("🧺 Cambio Biancheria")
+    st.write(
+        "La programmazione viene calcolata automaticamente dalle prenotazioni: "
+        "il primo cambio è previsto al **4° giorno di permanenza** (3 giorni dopo il check-in), "
+        "poi ogni 4 giorni finché l'ospite è ancora presente."
+    )
+
+    cambi = righe_cambio_biancheria()
+
+    if not cambi:
+        st.info("Nessun cambio biancheria previsto con le prenotazioni attuali.")
+    else:
+        oggi = date.today()
+        da_fare_oggi = sum(1 for r in cambi if r["Data cambio"] == oggi and not r["effettuato"])
+        in_ritardo = sum(1 for r in cambi if r["Data cambio"] < oggi and not r["effettuato"])
+        futuri = sum(1 for r in cambi if r["Data cambio"] > oggi and not r["effettuato"])
+        effettuati = sum(1 for r in cambi if r["effettuato"])
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Da fare oggi", da_fare_oggi)
+        m2.metric("In ritardo", in_ritardo)
+        m3.metric("Prossimi", futuri)
+        m4.metric("Effettuati", effettuati)
+
+        col1, col2 = st.columns([1, 2])
+        filtro = col1.selectbox(
+            "Mostra",
+            ["Da fare", "Tutti", "Oggi", "In ritardo", "Programmati", "Effettuati"],
+        )
+        ricerca_biancheria = col2.text_input(
+            "🔎 Cerca camera o ospite",
+            placeholder="Es. La Cinta oppure Mario Rossi",
+            key="ricerca_biancheria",
+        )
+
+        visibili = []
+        for r in cambi:
+            if filtro == "Da fare" and r["effettuato"]:
+                continue
+            if filtro == "Oggi" and not (r["Data cambio"] == oggi and not r["effettuato"]):
+                continue
+            if filtro == "In ritardo" and not (r["Data cambio"] < oggi and not r["effettuato"]):
+                continue
+            if filtro == "Programmati" and not (r["Data cambio"] > oggi and not r["effettuato"]):
+                continue
+            if filtro == "Effettuati" and not r["effettuato"]:
+                continue
+            testo = f"{r['Camera']} {r['Ospite']}".lower()
+            if ricerca_biancheria and ricerca_biancheria.lower() not in testo:
+                continue
+            visibili.append(r)
+
+        if not visibili:
+            st.info("Nessun cambio corrisponde ai filtri selezionati.")
+        else:
+            tabella = pd.DataFrame([
+                {
+                    "Data cambio": r["Data cambio"].strftime("%d/%m/%Y"),
+                    "Camera": r["Camera"],
+                    "Ospite": r["Ospite"],
+                    "Check-in": r["Arrivo"],
+                    "Check-out": r["Partenza"],
+                    "Stato": r["Stato"],
+                }
+                for r in visibili
+            ])
+            st.dataframe(tabella, use_container_width=True, hide_index=True)
+
+            st.subheader("Gestione cambi")
+            for n, r in enumerate(visibili):
+                with st.container(border=True):
+                    c1, c2 = st.columns([4, 1])
+                    c1.markdown(
+                        f"**{r['Data cambio'].strftime('%d/%m/%Y')} — {r['Camera']} — {r['Ospite']}**"
+                    )
+                    c1.caption(
+                        f"Soggiorno {r['Arrivo']} → {r['Partenza']} • {r['Stato']}"
+                    )
+
+                    if r["effettuato"]:
+                        if c2.button("↩️ Annulla fatto", key=f"annulla_cambio_{n}_{r['chiave']}", use_container_width=True):
+                            st.session_state.cambi_biancheria_effettuati.discard(r["chiave"])
+                            st.rerun()
+                    else:
+                        if c2.button("✅ Cambio effettuato", key=f"fatto_cambio_{n}_{r['chiave']}", type="primary", use_container_width=True):
+                            st.session_state.cambi_biancheria_effettuati.add(r["chiave"])
+                            st.success("Cambio biancheria segnato come effettuato.")
+                            st.rerun()
 
 # =========================================================
 # ARCHIVIO FILE
