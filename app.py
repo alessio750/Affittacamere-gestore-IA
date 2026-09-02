@@ -13,6 +13,7 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 from google import genai
+from google.genai import types as genai_types
 
 # =========================================================
 # CONFIGURAZIONE
@@ -32,8 +33,10 @@ MODELLI_GEMINI = [
 MAX_DOCUMENTI_IA = 6
 MAX_CARATTERI_PER_DOC = 12000
 MAX_MESSAGGI_STORICO_IA = 10
-VERSIONE_APP = "2.6 - Estrazione ibrida Python + Gemini"
+VERSIONE_APP = "2.7 - Timeout Gemini + Retry file lenti"
 MAX_ANALISI_PARALLELE = 2
+GEMINI_TIMEOUT_ESTRAZIONE_MS = 25000
+MODELLI_ESTRAZIONE_GEMINI = MODELLI_GEMINI[:2]
 
 CAMERE_DEFAULT = [
     "Baia di Budoni",
@@ -453,8 +456,20 @@ def estrai_contabilita_python(doc):
 
 
 def analizza_documento_contabile_gemini(doc, api_key=None):
-    """Fallback IA: viene chiamato soltanto quando Python non è abbastanza sicuro."""
-    client = genai.Client(api_key=api_key) if api_key else get_gemini_client()
+    """Fallback IA con timeout reale per richiesta.
+
+    Python resta la prima scelta. Gemini viene usato solo sui documenti difficili.
+    Ogni richiesta di estrazione ha un timeout HTTP: se un documento resta lento,
+    viene lasciato "Da riprovare" invece di bloccare tutta l'analisi.
+    """
+    chiave = api_key or st.secrets.get("GEMINI_API_KEY", "")
+    if not chiave:
+        raise RuntimeError("GEMINI_API_KEY non configurata")
+
+    client = genai.Client(
+        api_key=chiave,
+        http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_ESTRAZIONE_MS),
+    )
 
     prompt = f"""
 Sei un estrattore di dati contabili per un affittacamere italiano.
@@ -496,76 +511,80 @@ Tipo file: {doc.get('tipo', '')}
         prompt += f"\nTESTO ESTRATTO DAL DOCUMENTO:\n{testo[:30000]}"
 
     errori = []
-    # Due passaggi prudenti: evita di arrendersi al primo 503 ma non tiene bloccata l'app troppo a lungo.
-    for giro, attesa in enumerate((0, 3), start=1):
-        if attesa:
-            time.sleep(attesa)
-        for modello in MODELLI_GEMINI:
-            temp_path = None
-            try:
-                contents = [prompt]
-                if doc.get("tipo") == "PDF" and len(testo) < 150:
-                    uploaded, temp_path = prepara_file_gemini(client, doc)
-                    if uploaded is not None:
-                        contents.append(uploaded)
+    for modello in MODELLI_ESTRAZIONE_GEMINI:
+        temp_path = None
+        try:
+            contents = [prompt]
+            if doc.get("tipo") == "PDF" and len(testo) < 150:
+                uploaded, temp_path = prepara_file_gemini(client, doc)
+                if uploaded is not None:
+                    contents.append(uploaded)
 
-                response = client.models.generate_content(model=modello, contents=contents)
-                dati = estrai_json_da_testo(getattr(response, "text", ""))
+            response = client.models.generate_content(model=modello, contents=contents)
+            dati = estrai_json_da_testo(getattr(response, "text", ""))
 
-                if not dati.get("e_documento_contabile", True):
-                    return None, modello
+            if not dati.get("e_documento_contabile", True):
+                return None, modello
 
-                categoria = str(dati.get("categoria", "Altro") or "Altro")
-                if categoria not in CATEGORIE_CONTABILI:
-                    categoria = "Altro"
+            categoria = str(dati.get("categoria", "Altro") or "Altro")
+            if categoria not in CATEGORIE_CONTABILI:
+                categoria = "Altro"
 
-                imponibile = round(parse_numero(dati.get("imponibile")), 2)
-                iva = round(parse_numero(dati.get("iva")), 2)
-                totale = round(parse_numero(dati.get("totale")), 2)
-                if totale == 0 and (imponibile != 0 or iva != 0):
-                    totale = round(imponibile + iva, 2)
-                elif imponibile == 0 and totale != 0 and iva != 0:
-                    imponibile = round(totale - iva, 2)
-                elif iva == 0 and totale != 0 and imponibile != 0:
-                    iva = round(totale - imponibile, 2)
+            imponibile = round(parse_numero(dati.get("imponibile")), 2)
+            iva = round(parse_numero(dati.get("iva")), 2)
+            totale = round(parse_numero(dati.get("totale")), 2)
+            if totale == 0 and (imponibile != 0 or iva != 0):
+                totale = round(imponibile + iva, 2)
+            elif imponibile == 0 and totale != 0 and iva != 0:
+                imponibile = round(totale - iva, 2)
+            elif iva == 0 and totale != 0 and imponibile != 0:
+                iva = round(totale - imponibile, 2)
 
-                riga = {
-                    "documento": doc.get("nome", ""),
-                    "hash_documento": doc.get("hash", ""),
-                    "tipo_documento": str(dati.get("tipo_documento", "Altro") or "Altro"),
-                    "fornitore": str(dati.get("fornitore", "") or ""),
-                    "numero_documento": str(dati.get("numero_documento", "") or ""),
-                    "data_documento": str(dati.get("data_documento", "") or ""),
-                    "categoria": categoria,
-                    "imponibile": imponibile,
-                    "iva": iva,
-                    "totale": totale,
-                    "aliquota_iva": str(dati.get("aliquota_iva", "") or ""),
-                    "valuta": str(dati.get("valuta", "EUR") or "EUR"),
-                    "note": str(dati.get("note", "") or ""),
-                    "estratto_con": modello,
-                    "verificato": False,
-                    "estratto_il": datetime.now().strftime("%d/%m/%Y %H:%M"),
-                }
-                return riga, modello
-            except Exception as e:
-                errori.append(f"giro {giro} - {modello}: {str(e)[:180]}")
-            finally:
-                if temp_path:
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
+            riga = {
+                "documento": doc.get("nome", ""),
+                "hash_documento": doc.get("hash", ""),
+                "tipo_documento": str(dati.get("tipo_documento", "Altro") or "Altro"),
+                "fornitore": str(dati.get("fornitore", "") or ""),
+                "numero_documento": str(dati.get("numero_documento", "") or ""),
+                "data_documento": str(dati.get("data_documento", "") or ""),
+                "categoria": categoria,
+                "imponibile": imponibile,
+                "iva": iva,
+                "totale": totale,
+                "aliquota_iva": str(dati.get("aliquota_iva", "") or ""),
+                "valuta": str(dati.get("valuta", "EUR") or "EUR"),
+                "note": str(dati.get("note", "") or ""),
+                "estratto_con": modello,
+                "verificato": False,
+                "estratto_il": datetime.now().strftime("%d/%m/%Y %H:%M"),
+            }
+            return riga, modello
+        except Exception as e:
+            msg = str(e)
+            errori.append(f"{modello}: {msg[:180]}")
+            basso = msg.lower()
+            # Un timeout non passa attraverso altri modelli: il file viene riprovato in seguito.
+            if "timeout" in basso or "timed out" in basso or "deadline" in basso:
+                raise RuntimeError(
+                    f"TIMEOUT: Gemini non ha risposto entro {GEMINI_TIMEOUT_ESTRAZIONE_MS // 1000}s. "
+                    "Il documento è stato lasciato da riprovare."
+                )
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
-    raise RuntimeError(" | ".join(errori[-6:]))
+    raise RuntimeError(" | ".join(errori[-4:]))
 
 
 def analizza_documenti_non_elaborati(documenti=None, barra=None, stato_testo=None):
-    """Motore ibrido 2.6.
+    """Motore ibrido 2.7.
 
     1) Python prova immediatamente TUTTI i documenti leggibili.
     2) Solo i documenti ambigui passano a Gemini.
-    3) Gemini usa al massimo due richieste contemporanee, con retry.
+    3) Gemini usa al massimo due richieste contemporanee e un timeout HTTP per non bloccare la pagina.
 
     In questo modo decine di fatture testuali possono essere elaborate in pochi
     secondi senza consumare quote IA; l'IA resta disponibile per i casi difficili.
@@ -574,7 +593,7 @@ def analizza_documenti_non_elaborati(documenti=None, barra=None, stato_testo=Non
     da_analizzare = [d for d in docs if documento_da_analizzare(d)]
     risultati = {
         "aggiunti": 0, "non_contabili": 0, "errori": [],
-        "python": 0, "gemini": 0, "fallback": 0,
+        "python": 0, "gemini": 0, "fallback": 0, "da_riprovare": 0,
     }
     totale = len(da_analizzare)
     if totale == 0:
@@ -594,6 +613,7 @@ def analizza_documenti_non_elaborati(documenti=None, barra=None, stato_testo=Non
                 st.session_state.contabilita.append(riga)
                 doc["analizzato_contabilita"] = True
                 doc["esito_analisi"] = "Inserito in Contabilità (Python)"
+                doc.pop("ultimo_errore_analisi", None)
                 risultati["aggiunti"] += 1
                 risultati["python"] += 1
                 completati += 1
@@ -643,14 +663,20 @@ def analizza_documenti_non_elaborati(documenti=None, barra=None, stato_testo=Non
                 if riga is None:
                     doc["analizzato_contabilita"] = True
                     doc["esito_analisi"] = "Non contabile"
+                    doc.pop("ultimo_errore_analisi", None)
                     risultati["non_contabili"] += 1
                 else:
                     st.session_state.contabilita.append(riga)
                     doc["analizzato_contabilita"] = True
                     doc["esito_analisi"] = "Inserito in Contabilità (Gemini)"
+                    doc.pop("ultimo_errore_analisi", None)
                     risultati["aggiunti"] += 1
                     risultati["gemini"] += 1
             except Exception as e:
+                doc["analizzato_contabilita"] = False
+                doc["esito_analisi"] = "Da riprovare"
+                doc["ultimo_errore_analisi"] = str(e)[:300]
+                risultati["da_riprovare"] += 1
                 risultati["errori"].append(f"{doc['nome']}: {e}")
 
             if barra is not None:
@@ -1505,41 +1531,49 @@ elif menu == "📂 Archivio e Analisi File":
 
     # CASSELLA BEN VISIBILE PER L'ANALISI CONTABILE
     da_elaborare = [d for d in st.session_state.documenti_caricati if documento_da_analizzare(d)]
+    da_riprovare = [d for d in da_elaborare if d.get("esito_analisi") == "Da riprovare"]
+    nuovi_da_elaborare = [d for d in da_elaborare if d.get("esito_analisi") != "Da riprovare"]
     gia_elaborati = len(st.session_state.documenti_caricati) - len(da_elaborare)
 
     with st.container(border=True):
         st.subheader("🤖 Analisi contabile automatica")
         st.write(
-            "Dopo aver caricato i documenti, premi il pulsante qui sotto. "
-            "La versione 2.6 usa **Python come prima scelta**: prova a estrarre immediatamente i dati dai file leggibili. "
-            "Solo i documenti ambigui o difficili vengono inviati a **Gemini come fallback**. "
-            "I risultati finiscono nella pagina **📊 Contabilità**."
+            "Python prova per primo tutti i documenti. Solo i file difficili passano a Gemini. "
+            f"Nella versione 2.7 ogni richiesta Gemini ha un **timeout di {GEMINI_TIMEOUT_ESTRAZIONE_MS // 1000} secondi**: "
+            "se un file è lento, viene lasciato **Da riprovare** e gli altri risultati vengono comunque salvati."
         )
-        c_a, c_b, c_c = st.columns(3)
-        c_a.metric("Da analizzare", len(da_elaborare))
-        c_b.metric("Già analizzati", gia_elaborati)
-        c_c.metric("Righe in Contabilità", len(st.session_state.contabilita))
+        c_a, c_b, c_c, c_d = st.columns(4)
+        c_a.metric("Nuovi da analizzare", len(nuovi_da_elaborare))
+        c_b.metric("Da riprovare", len(da_riprovare))
+        c_c.metric("Già analizzati", gia_elaborati)
+        c_d.metric("Righe in Contabilità", len(st.session_state.contabilita))
 
         avvia_analisi = st.button(
             "🤖 ANALIZZA I NUOVI FILE",
             type="primary",
             use_container_width=True,
-            disabled=len(da_elaborare) == 0,
+            disabled=len(nuovi_da_elaborare) == 0,
+        )
+        avvia_retry = st.button(
+            "🔄 RIPROVA SOLO I FILE LENTI / FALLITI",
+            use_container_width=True,
+            disabled=len(da_riprovare) == 0,
         )
 
         if len(da_elaborare) == 0 and st.session_state.documenti_caricati:
             st.success("✅ Tutti i documenti presenti sono già stati analizzati.")
-        elif len(da_elaborare) > 0:
+        elif da_elaborare:
             st.caption(
-                f"Verranno controllati {len(da_elaborare)} file. Python li prova subito tutti; "
-                f"solo quelli che richiedono IA passeranno a Gemini, al massimo {min(MAX_ANALISI_PARALLELE, len(da_elaborare))} alla volta."
+                f"Python lavora immediatamente; Gemini interviene solo dove serve, al massimo "
+                f"{MAX_ANALISI_PARALLELE} file alla volta. Un file lento non blocca più l'intera coda."
             )
 
-    if avvia_analisi:
-        st.info("Analisi ibrida in corso: Python lavora per primo, Gemini interviene solo dove serve. Non chiudere questa pagina fino al completamento.")
+    documenti_da_processare = nuovi_da_elaborare if avvia_analisi else (da_riprovare if avvia_retry else [])
+    if avvia_analisi or avvia_retry:
+        st.info("Analisi ibrida in corso. I risultati Python vengono salvati subito; un file Gemini lento verrà marcato da riprovare senza bloccare tutto.")
         barra_ia = st.progress(0)
         stato_ia = st.empty()
-        risultati = analizza_documenti_non_elaborati(barra=barra_ia, stato_testo=stato_ia)
+        risultati = analizza_documenti_non_elaborati(documenti=documenti_da_processare, barra=barra_ia, stato_testo=stato_ia)
         stato_ia.empty()
         barra_ia.empty()
         if risultati["aggiunti"]:
@@ -1550,7 +1584,7 @@ elif menu == "📂 Archivio e Analisi File":
         if risultati["non_contabili"]:
             st.info(f"ℹ️ {risultati['non_contabili']} file sono stati letti ma non riconosciuti come documenti contabili.")
         if risultati["errori"]:
-            st.warning(f"⚠️ {len(risultati['errori'])} documenti non sono stati elaborati e potranno essere riprovati.")
+            st.warning(f"⚠️ {len(risultati['errori'])} documenti sono rimasti da riprovare. Gli altri risultati sono stati salvati.")
             with st.expander("Mostra errori di analisi"):
                 for errore in risultati["errori"]:
                     st.write(f"- {errore}")
@@ -1586,6 +1620,8 @@ elif menu == "📂 Archivio e Analisi File":
                     badge = " • ✅ Contabilità"
                 elif doc.get("analizzato_contabilita", False):
                     badge = " • ℹ️ Analizzato (non contabile)"
+                elif doc.get("esito_analisi") == "Da riprovare":
+                    badge = " • ⚠️ Da riprovare"
                 else:
                     badge = " • ⏳ Da analizzare"
                 c1.markdown(f"**📄 {doc['nome']}**")
@@ -1593,6 +1629,8 @@ elif menu == "📂 Archivio e Analisi File":
                     f"{doc['tipo']} • {doc.get('dimensione', 0) / 1024:.1f} KB • "
                     f"{doc.get('caricato_il', '')}{badge}"
                 )
+                if doc.get("esito_analisi") == "Da riprovare" and doc.get("ultimo_errore_analisi"):
+                    c1.caption(f"Ultimo tentativo: {doc.get('ultimo_errore_analisi')}")
 
                 if c2.button("👁️ Anteprima", key=f"preview_{indice}"):
                     st.session_state[f"mostra_doc_{indice}"] = not st.session_state.get(f"mostra_doc_{indice}", False)
@@ -1618,7 +1656,7 @@ elif menu == "📂 Archivio e Analisi File":
 
     st.caption(
         "Per molti documenti è meglio caricarli a gruppi e poi premere 'Analizza nuovi file'. "
-        "L'analisi usa una chiamata IA per documento non ancora elaborato; in seguito i totali vengono calcolati da Python."
+        "Python gestisce i documenti leggibili; Gemini viene usato solo come fallback con timeout. I totali restano calcolati da Python."
     )
 
 # =========================================================
