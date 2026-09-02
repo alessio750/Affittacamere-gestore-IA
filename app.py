@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -31,7 +32,8 @@ MODELLI_GEMINI = [
 MAX_DOCUMENTI_IA = 6
 MAX_CARATTERI_PER_DOC = 12000
 MAX_MESSAGGI_STORICO_IA = 10
-VERSIONE_APP = "2.4.1 - Domande contabili composte"
+VERSIONE_APP = "2.5 - Analisi parallela documenti"
+MAX_ANALISI_PARALLELE = 4
 
 CAMERE_DEFAULT = [
     "Baia di Budoni",
@@ -289,9 +291,13 @@ def prepara_file_gemini(client, doc):
     return uploaded, temp.name
 
 
-def analizza_documento_contabile(doc):
-    """Usa Gemini una sola volta per trasformare un documento in dati contabili strutturati."""
-    client = get_gemini_client()
+def analizza_documento_contabile(doc, api_key=None):
+    """Usa Gemini per trasformare un documento in dati contabili strutturati.
+
+    api_key può essere passata dal thread principale: in questo modo le analisi
+    parallele non devono leggere st.secrets dai thread secondari.
+    """
+    client = genai.Client(api_key=api_key) if api_key else get_gemini_client()
 
     prompt = f"""
 Sei un estrattore di dati contabili per un affittacamere italiano.
@@ -397,31 +403,67 @@ Tipo file: {doc.get('tipo', '')}
 
 
 def analizza_documenti_non_elaborati(documenti=None, barra=None, stato_testo=None):
+    """Analizza i documenti in parallelo, a piccoli gruppi, senza scrivere
+    nello st.session_state dai thread secondari.
+
+    Questo evita che un singolo PDF lento blocchi tutti gli altri e rende molto
+    più rapido il caricamento di decine di fatture. Il limite di concorrenza
+    resta volutamente prudente per non saturare le quote API di Gemini.
+    """
     docs = documenti if documenti is not None else st.session_state.documenti_caricati
     da_analizzare = [d for d in docs if documento_da_analizzare(d)]
 
     risultati = {"aggiunti": 0, "non_contabili": 0, "errori": []}
     totale = len(da_analizzare)
+    if totale == 0:
+        return risultati
 
-    for n, doc in enumerate(da_analizzare, start=1):
-        if stato_testo is not None:
-            stato_testo.write(f"Analisi {n}/{totale}: **{doc['nome']}**")
-        try:
-            riga, _ = analizza_documento_contabile(doc)
-            if riga is None:
-                doc["analizzato_contabilita"] = True
-                doc["esito_analisi"] = "Non contabile"
-                risultati["non_contabili"] += 1
-            else:
-                st.session_state.contabilita.append(riga)
-                doc["analizzato_contabilita"] = True
-                doc["esito_analisi"] = "Inserito in Contabilità"
-                risultati["aggiunti"] += 1
-        except Exception as e:
-            risultati["errori"].append(f"{doc['nome']}: {e}")
+    api_key = st.secrets.get("GEMINI_API_KEY", "")
+    if not api_key:
+        risultati["errori"].append("La chiave GEMINI_API_KEY non è presente nei Secrets di Streamlit.")
+        return risultati
 
-        if barra is not None and totale:
-            barra.progress(n / totale)
+    lavoratori = min(MAX_ANALISI_PARALLELE, totale)
+    completati = 0
+
+    if stato_testo is not None:
+        stato_testo.write(
+            f"🚀 Analisi parallela avviata: **{totale} documenti**, fino a **{lavoratori} contemporaneamente**."
+        )
+
+    def lavoro(doc):
+        return doc, analizza_documento_contabile(doc, api_key=api_key)
+
+    with ThreadPoolExecutor(max_workers=lavoratori, thread_name_prefix="fatture") as executor:
+        future_map = {executor.submit(lavoro, doc): doc for doc in da_analizzare}
+
+        for future in as_completed(future_map):
+            doc = future_map[future]
+            completati += 1
+            try:
+                _, (riga, _) = future.result()
+                if riga is None:
+                    doc["analizzato_contabilita"] = True
+                    doc["esito_analisi"] = "Non contabile"
+                    risultati["non_contabili"] += 1
+                else:
+                    # La modifica dello stato Streamlit avviene solo nel thread principale.
+                    st.session_state.contabilita.append(riga)
+                    doc["analizzato_contabilita"] = True
+                    doc["esito_analisi"] = "Inserito in Contabilità"
+                    risultati["aggiunti"] += 1
+            except Exception as e:
+                risultati["errori"].append(f"{doc['nome']}: {e}")
+
+            if barra is not None:
+                barra.progress(completati / totale)
+            if stato_testo is not None:
+                ok = risultati["aggiunti"] + risultati["non_contabili"]
+                err = len(risultati["errori"])
+                stato_testo.write(
+                    f"⚡ Completati **{completati}/{totale}** • riusciti **{ok}** • errori **{err}** • "
+                    f"ultimo: **{doc['nome']}**"
+                )
 
     return risultati
 
@@ -1274,7 +1316,8 @@ elif menu == "📂 Archivio e Analisi File":
         st.subheader("🤖 Analisi contabile automatica")
         st.write(
             "Dopo aver caricato le fatture, premi il pulsante qui sotto. "
-            "Gemini leggerà **solo i documenti nuovi**, estrarrà i dati contabili e li passerà alla pagina **📊 Contabilità**."
+            "Gemini leggerà **solo i documenti nuovi**. La versione 2.5 li analizza **in parallelo a piccoli gruppi**, "
+            "estrae i dati contabili e li passa alla pagina **📊 Contabilità**."
         )
         c_a, c_b, c_c = st.columns(3)
         c_a.metric("Da analizzare", len(da_elaborare))
@@ -1292,11 +1335,12 @@ elif menu == "📂 Archivio e Analisi File":
             st.success("✅ Tutti i documenti presenti sono già stati analizzati.")
         elif len(da_elaborare) > 0:
             st.caption(
-                f"Verranno analizzati {len(da_elaborare)} file. Durante l'operazione vedrai l'avanzamento documento per documento."
+                f"Verranno analizzati {len(da_elaborare)} file, fino a {min(MAX_ANALISI_PARALLELE, len(da_elaborare))} contemporaneamente. "
+                "Vedrai l'avanzamento man mano che ciascun documento termina."
             )
 
     if avvia_analisi:
-        st.info("Analisi in corso: non chiudere la pagina fino al completamento.")
+        st.info("Analisi parallela in corso: non chiudere questa pagina fino al completamento. Puoi usare altre schede del browser.")
         barra_ia = st.progress(0)
         stato_ia = st.empty()
         risultati = analizza_documenti_non_elaborati(barra=barra_ia, stato_testo=stato_ia)
