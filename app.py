@@ -1,9 +1,10 @@
-import hashlib
+
 import io
 import json
 import os
 import re
 import tempfile
+import time
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -30,7 +31,7 @@ MODELLI_GEMINI = [
 MAX_DOCUMENTI_IA = 6
 MAX_CARATTERI_PER_DOC = 12000
 MAX_MESSAGGI_STORICO_IA = 10
-VERSIONE_APP = "2.2 - Contabilità automatica"
+VERSIONE_APP = "2.3 - Contabilità intelligente + retry IA"
 
 CAMERE_DEFAULT = [
     "Baia di Budoni",
@@ -625,6 +626,101 @@ def storico_chat_per_ia():
     return "\n".join(righe)
 
 
+def formatta_euro(valore):
+    testo = f"{float(valore):,.2f}"
+    testo = testo.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"€ {testo}"
+
+
+def risposta_contabile_python(domanda):
+    """Risponde senza Gemini alle domande contabili semplici già coperte dai dati strutturati."""
+    if not st.session_state.contabilita:
+        return None
+
+    q = normalizza_testo(domanda)
+    segnali_contabili = [
+        "spes", "totale", "iva", "imponibile", "fattur", "document",
+        "fornitor", "categoria", "pagato", "pagata", "quanto", "quante", "quanti"
+    ]
+    if not any(x in q for x in segnali_contabili):
+        return None
+
+    # Le richieste interpretative restano a Gemini.
+    segnali_ia = [
+        "analizza", "spiega", "consigli", "consiglio", "risparm", "anomali",
+        "perche", "perché", "conviene", "preved", "strateg", "valuta", "confronta"
+    ]
+    if any(x in q for x in segnali_ia):
+        return None
+
+    df = dataframe_contabilita()
+    if df.empty:
+        return None
+    riepilogo = riepilogo_contabile_python()
+
+    # Riconosce un fornitore già presente nella domanda.
+    fornitori = [str(x) for x in df["Fornitore"].dropna().unique() if str(x).strip()]
+    for fornitore in sorted(fornitori, key=len, reverse=True):
+        if normalizza_testo(fornitore) in q:
+            righe = df[df["Fornitore"] == fornitore]
+            tot = float(righe["Totale (€)"].sum())
+            iva = float(righe["IVA (€)"].sum())
+            imp = float(righe["Imponibile (€)"].sum())
+            return (
+                f"📊 **Dati calcolati direttamente da Python**\n\n"
+                f"Per **{fornitore}** risultano **{len(righe)} documenti**:\n"
+                f"- Totale: **{formatta_euro(tot)}**\n"
+                f"- Imponibile: **{formatta_euro(imp)}**\n"
+                f"- IVA: **{formatta_euro(iva)}**\n\n"
+                "Questa risposta non ha utilizzato Gemini."
+            )
+
+    # Riconosce una categoria già presente nella domanda.
+    categorie = [str(x) for x in df["Categoria"].dropna().unique() if str(x).strip()]
+    for categoria in sorted(categorie, key=len, reverse=True):
+        if normalizza_testo(categoria) in q:
+            righe = df[df["Categoria"] == categoria]
+            tot = float(righe["Totale (€)"].sum())
+            return (
+                f"📊 **Dati calcolati direttamente da Python**\n\n"
+                f"La categoria **{categoria}** comprende **{len(righe)} documenti** "
+                f"per un totale di **{formatta_euro(tot)}**.\n\n"
+                "Questa risposta non ha utilizzato Gemini."
+            )
+
+    chiede_categoria_top = (
+        "categoria" in q and any(x in q for x in ["maggiore", "maggior", "piu", "più", "inciso", "alta", "costosa"])
+    )
+    chiede_totale = any(x in q for x in ["totale", "quanto abbiamo speso", "quanto ho speso", "spesa complessiva", "spese complessive"])
+    chiede_iva = "iva" in q
+    chiede_imponibile = "imponibile" in q
+    chiede_numero = any(x in q for x in ["quante fatture", "quanti documenti", "numero fatture", "numero documenti"])
+
+    parti = []
+    if chiede_totale:
+        parti.append(f"- Totale spese: **{formatta_euro(riepilogo['totale'])}**")
+    if chiede_imponibile:
+        parti.append(f"- Imponibile totale: **{formatta_euro(riepilogo['imponibile'])}**")
+    if chiede_iva:
+        parti.append(f"- IVA totale: **{formatta_euro(riepilogo['iva'])}**")
+    if chiede_numero:
+        parti.append(f"- Documenti contabili: **{riepilogo['numero_documenti']}**")
+    if chiede_categoria_top:
+        per_categoria = df.groupby("Categoria")["Totale (€)"].sum().sort_values(ascending=False)
+        if not per_categoria.empty:
+            nome = str(per_categoria.index[0])
+            valore = float(per_categoria.iloc[0])
+            parti.append(f"- Categoria con maggiore spesa: **{nome}** ({formatta_euro(valore)})")
+
+    if not parti:
+        return None
+
+    return (
+        "📊 **Risposta dalla Contabilità (Python)**\n\n" + "\n".join(parti) +
+        "\n\n⚡ Risposta ottenuta senza chiamare Gemini, usando i dati già estratti nella pagina Contabilità."
+    )
+
+
 def invia_a_gemini(domanda):
     documenti = seleziona_documenti_rilevanti(domanda)
     contesto = crea_contesto_gestionale(documenti)
@@ -656,29 +752,37 @@ DOMANDA DELL'UTENTE:
 
     client = get_gemini_client()
     errori = []
+    attese_retry = [0, 2, 5, 10]
 
-    for modello in MODELLI_GEMINI:
-        temp_paths = []
-        try:
-            file_gemini, temp_paths = prepara_pdf_per_gemini(client, documenti)
-            contents = [istruzioni] + file_gemini
-            response = client.models.generate_content(model=modello, contents=contents)
-            testo = getattr(response, "text", None)
-            if testo:
-                return testo, modello
-            errori.append(f"{modello}: risposta vuota")
-        except Exception as e:
-            errori.append(f"{modello}: {str(e)[:250]}")
-        finally:
-            for path in temp_paths:
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
+    for tentativo, attesa in enumerate(attese_retry, start=1):
+        if attesa:
+            time.sleep(attesa)
+
+        for modello in MODELLI_GEMINI:
+            temp_paths = []
+            try:
+                file_gemini, temp_paths = prepara_pdf_per_gemini(client, documenti)
+                contents = [istruzioni] + file_gemini
+                response = client.models.generate_content(model=modello, contents=contents)
+                testo = getattr(response, "text", None)
+                if testo:
+                    return testo, modello
+                errori.append(f"tentativo {tentativo} - {modello}: risposta vuota")
+            except Exception as e:
+                msg = str(e)
+                errori.append(f"tentativo {tentativo} - {modello}: {msg[:180]}")
+                # 503/429 sono tipicamente temporanei: il ciclo farà retry/backoff.
+            finally:
+                for path in temp_paths:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
 
     raise RuntimeError(
-        "In questo momento i modelli Gemini non stanno rispondendo. "
-        "Riprova tra poco. Dettaglio tecnico: " + " | ".join(errori)
+        "Gemini è temporaneamente indisponibile anche dopo i tentativi automatici. "
+        "I dati della Contabilità restano comunque disponibili. "
+        "Ultimi errori: " + " | ".join(errori[-3:])
     )
 
 # =========================================================
@@ -1274,7 +1378,7 @@ elif menu == "💬 Chat IA Assistente":
     st.header("Assistente Virtuale IA dell'Affittacamere")
     st.write(
         "Chiedi qualsiasi cosa su camere, prenotazioni, incassi, spese, Excel, fatture e contabilità. "
-        "Per i totali contabili l'IA riceve già i risultati calcolati da Python."
+        "Le domande contabili semplici vengono risposte direttamente da Python; Gemini interviene solo quando serve interpretazione o analisi."
     )
 
     for messaggio in st.session_state.messaggi_chat:
@@ -1291,14 +1395,20 @@ elif menu == "💬 Chat IA Assistente":
         with st.chat_message("assistant"):
             with st.spinner("Sto analizzando i dati e preparando la risposta..."):
                 try:
-                    risposta, modello_usato = invia_a_gemini(input_utente)
-                    st.markdown(risposta)
-                    st.caption(f"IA: {modello_usato} • Totali contabili: Python")
+                    risposta_python = risposta_contabile_python(input_utente)
+                    if risposta_python:
+                        risposta = risposta_python
+                        st.markdown(risposta)
+                        st.caption("🧮 Motore: Python • Gemini non utilizzato")
+                    else:
+                        risposta, modello_usato = invia_a_gemini(input_utente)
+                        st.markdown(risposta)
+                        st.caption(f"🤖 IA: {modello_usato} • Retry automatico attivo")
                 except Exception as e:
                     risposta = (
-                        "❌ In questo momento Gemini non riesce a rispondere. "
-                        "Potrebbe trattarsi di un sovraccarico temporaneo o di un limite API. Riprova tra poco.\n\n"
-                        f"Dettaglio: `{str(e)}`"
+                        "⚠️ Gemini è momentaneamente indisponibile anche dopo i tentativi automatici. "
+                        "La pagina 📊 Contabilità e i calcoli Python continuano a funzionare normalmente. "
+                        "Riprova tra poco per le richieste che richiedono l'IA."
                     )
                     st.error(risposta)
 
