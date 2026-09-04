@@ -77,7 +77,7 @@ MODELLI_GEMINI = [
 MAX_DOCUMENTI_IA = 6
 MAX_CARATTERI_PER_DOC = 12000
 MAX_MESSAGGI_STORICO_IA = 10
-VERSIONE_APP = "2.10 - Cambio biancheria automatico + motore 2.9"
+VERSIONE_APP = "2.11 - Backup per periodo + Cambio biancheria"
 MAX_ANALISI_PARALLELE = 2
 GEMINI_TIMEOUT_ESTRAZIONE_MS = 25000
 MODELLI_ESTRAZIONE_GEMINI = MODELLI_GEMINI[:2]
@@ -1449,15 +1449,63 @@ DOMANDA DELL'UTENTE:
 # =========================================================
 # BACKUP EXCEL
 # =========================================================
-def genera_backup_excel():
+def _data_sicura(valore):
+    """Converte una data proveniente dai dati dell'app in date, oppure None."""
+    if valore is None or str(valore).strip() in ("", "—", "nan", "None"):
+        return None
+    try:
+        return pd.to_datetime(valore, dayfirst=True, errors="raise").date()
+    except Exception:
+        return None
+
+
+def _prenotazione_nel_periodo(prenotazione, data_inizio, data_fine):
+    """Include una prenotazione se il soggiorno si sovrappone almeno in parte al periodo."""
+    arrivo = _data_sicura(prenotazione.get("Arrivo"))
+    partenza = _data_sicura(prenotazione.get("Partenza"))
+    if arrivo is None or partenza is None:
+        return False
+    # Il checkout è il giorno di partenza: basta che una parte del soggiorno cada nel periodo.
+    return arrivo <= data_fine and partenza >= data_inizio
+
+
+def _riga_contabile_nel_periodo(riga, data_inizio, data_fine):
+    data_doc = _data_sicura(riga.get("data_documento"))
+    return data_doc is not None and data_inizio <= data_doc <= data_fine
+
+
+def _documento_nel_periodo(doc, data_inizio, data_fine, nomi_documenti_contabili):
+    # Se il documento ha generato una riga contabile nel periodo, va incluso certamente.
+    if doc.get("nome") in nomi_documenti_contabili:
+        return True
+    # Per file non contabili usiamo la data di caricamento, quando disponibile.
+    data_caricamento = _data_sicura(doc.get("caricato_il"))
+    return data_caricamento is not None and data_inizio <= data_caricamento <= data_fine
+
+
+def genera_backup_excel(data_inizio=None, data_fine=None, etichetta_periodo="Tutto"):
+    """Genera il backup completo oppure filtrato per periodo.
+
+    Prenotazioni: incluse quando il soggiorno si sovrappone almeno in parte al periodo.
+    Contabilità: filtrata sulla data del documento/fattura.
+    Archivio: include i documenti contabili del periodo e i file non contabili caricati nel periodo.
+    Stato camere: resta una fotografia dello stato corrente dell'app.
+    """
     output = io.BytesIO()
     aggiorna_stato_camere()
 
-    df_prenotazioni = pd.DataFrame(st.session_state.prenotazioni)
-    if not df_prenotazioni.empty:
-        df_prenotazioni["Stato"] = [
-            stato_prenotazione(p) for p in st.session_state.prenotazioni
+    filtro_attivo = data_inizio is not None and data_fine is not None
+
+    prenotazioni_base = st.session_state.prenotazioni
+    if filtro_attivo:
+        prenotazioni_base = [
+            p for p in prenotazioni_base
+            if _prenotazione_nel_periodo(p, data_inizio, data_fine)
         ]
+
+    df_prenotazioni = pd.DataFrame(prenotazioni_base)
+    if not df_prenotazioni.empty:
+        df_prenotazioni["Stato"] = [stato_prenotazione(p) for p in prenotazioni_base]
 
     df_camere = pd.DataFrame(
         [
@@ -1470,6 +1518,44 @@ def genera_backup_excel():
         ]
     )
 
+    righe_contabili = st.session_state.contabilita
+    if filtro_attivo:
+        righe_contabili = [
+            r for r in righe_contabili
+            if _riga_contabile_nel_periodo(r, data_inizio, data_fine)
+        ]
+
+    # Creiamo la tabella contabile senza modificare la sessione originale.
+    colonne_contabilita = [
+        "Data", "Fornitore", "Numero documento", "Categoria", "Imponibile (€)",
+        "IVA (€)", "Totale (€)", "Aliquota IVA", "Documento", "Verificato"
+    ]
+    righe_df_contabilita = []
+    for r in righe_contabili:
+        righe_df_contabilita.append({
+            "Data": r.get("data_documento", "") or "—",
+            "Fornitore": r.get("fornitore", "") or "—",
+            "Numero documento": r.get("numero_documento", "") or "—",
+            "Categoria": r.get("categoria", "Altro"),
+            "Imponibile (€)": round(parse_numero(r.get("imponibile")), 2),
+            "IVA (€)": round(parse_numero(r.get("iva")), 2),
+            "Totale (€)": round(parse_numero(r.get("totale")), 2),
+            "Aliquota IVA": r.get("aliquota_iva", ""),
+            "Documento": r.get("documento", ""),
+            "Verificato": "Sì" if r.get("verificato") else "No",
+        })
+    df_contabilita = pd.DataFrame(righe_df_contabilita, columns=colonne_contabilita)
+
+    nomi_documenti_contabili = {
+        str(r.get("documento", "")) for r in righe_contabili if r.get("documento")
+    }
+    documenti_base = st.session_state.documenti_caricati
+    if filtro_attivo:
+        documenti_base = [
+            doc for doc in documenti_base
+            if _documento_nel_periodo(doc, data_inizio, data_fine, nomi_documenti_contabili)
+        ]
+
     df_documenti = pd.DataFrame(
         [
             {
@@ -1479,13 +1565,29 @@ def genera_backup_excel():
                 "Caricato il": doc.get("caricato_il", ""),
                 "Elaborato contabilità": "Sì" if trova_riga_contabile_per_doc(doc) is not None else "No",
             }
-            for doc in st.session_state.documenti_caricati
+            for doc in documenti_base
         ]
     )
 
-    df_contabilita = dataframe_contabilita()
+    riepilogo = riepilogo_contabile_python(righe_contabili)
+
+    if filtro_attivo:
+        periodo_testo = f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
+    else:
+        periodo_testo = "Tutti i dati disponibili"
+
+    df_periodo = pd.DataFrame([
+        {"Impostazione": "Tipo esportazione", "Valore": etichetta_periodo},
+        {"Impostazione": "Periodo effettivo", "Valore": periodo_testo},
+        {"Impostazione": "Prenotazioni incluse", "Valore": len(prenotazioni_base)},
+        {"Impostazione": "Documenti contabili inclusi", "Valore": len(righe_contabili)},
+        {"Impostazione": "File archivio inclusi", "Valore": len(documenti_base)},
+        {"Impostazione": "Generato il", "Valore": datetime.now().strftime('%d/%m/%Y %H:%M')},
+    ])
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_periodo.to_excel(writer, sheet_name="Periodo esportato", index=False)
+
         if df_prenotazioni.empty:
             pd.DataFrame(
                 columns=["Ospite", "Camera", "Arrivo", "Partenza", "Prezzo (€)", "Stato"]
@@ -1504,7 +1606,6 @@ def genera_backup_excel():
 
         df_contabilita.to_excel(writer, sheet_name="Contabilita", index=False)
 
-        riepilogo = riepilogo_contabile_python()
         pd.DataFrame(
             [
                 {"Voce": "Numero documenti", "Valore": riepilogo["numero_documenti"]},
@@ -2125,23 +2226,83 @@ elif menu == "📊 Contabilità":
 elif menu == "💾 Backup Dati":
     st.header("Backup ed esportazione")
     st.write(
-        "Scarica un Excel con prenotazioni, stato camere, archivio documenti, contabilità e riepilogo contabile."
+        "Scarica un Excel completo oppure limitato a un periodo preciso. "
+        "Le prenotazioni vengono incluse anche quando solo una parte del soggiorno cade nel periodo selezionato."
     )
 
-    backup = genera_backup_excel()
-    nome_backup = f"backup_affittacamere_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.xlsx"
+    with st.container(border=True):
+        st.subheader("📅 Periodo da esportare")
+        scelta_periodo = st.selectbox(
+            "Scegli il periodo",
+            ["Tutto", "Oggi", "Questo mese", "Quest'anno", "Periodo personalizzato"],
+            index=0,
+        )
 
-    st.download_button(
-        "📥 Scarica backup Excel",
-        data=backup,
-        file_name=nome_backup,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+        oggi = date.today()
+        data_inizio_backup = None
+        data_fine_backup = None
+
+        if scelta_periodo == "Oggi":
+            data_inizio_backup = oggi
+            data_fine_backup = oggi
+        elif scelta_periodo == "Questo mese":
+            data_inizio_backup = oggi.replace(day=1)
+            if oggi.month == 12:
+                primo_mese_successivo = date(oggi.year + 1, 1, 1)
+            else:
+                primo_mese_successivo = date(oggi.year, oggi.month + 1, 1)
+            data_fine_backup = primo_mese_successivo - pd.Timedelta(days=1)
+            if hasattr(data_fine_backup, "date"):
+                data_fine_backup = data_fine_backup.date()
+        elif scelta_periodo == "Quest'anno":
+            data_inizio_backup = date(oggi.year, 1, 1)
+            data_fine_backup = date(oggi.year, 12, 31)
+        elif scelta_periodo == "Periodo personalizzato":
+            c1, c2 = st.columns(2)
+            data_inizio_backup = c1.date_input("Dal", value=date(oggi.year, 1, 1), key="backup_dal")
+            data_fine_backup = c2.date_input("Al", value=oggi, key="backup_al")
+
+        periodo_valido = True
+        if data_inizio_backup is not None and data_fine_backup is not None:
+            if data_inizio_backup > data_fine_backup:
+                periodo_valido = False
+                st.error("La data iniziale non può essere successiva alla data finale.")
+            else:
+                st.success(
+                    f"Esporterai i dati dal **{data_inizio_backup.strftime('%d/%m/%Y')}** "
+                    f"al **{data_fine_backup.strftime('%d/%m/%Y')}**."
+                )
+                st.caption(
+                    "Le prenotazioni vengono incluse se il soggiorno si sovrappone anche solo in parte al periodo. "
+                    "Le fatture/righe contabili vengono filtrate in base alla data del documento."
+                )
+        else:
+            st.info("Verranno esportati tutti i dati disponibili nella sessione.")
+
+    if periodo_valido:
+        backup = genera_backup_excel(
+            data_inizio=data_inizio_backup,
+            data_fine=data_fine_backup,
+            etichetta_periodo=scelta_periodo,
+        )
+
+        if data_inizio_backup is not None and data_fine_backup is not None:
+            suffisso = f"{data_inizio_backup.strftime('%Y-%m-%d')}_al_{data_fine_backup.strftime('%Y-%m-%d')}"
+        else:
+            suffisso = "completo"
+        nome_backup = f"backup_affittacamere_{suffisso}_{datetime.now().strftime('%H-%M')}.xlsx"
+
+        st.download_button(
+            "📥 Scarica backup Excel",
+            data=backup,
+            file_name=nome_backup,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
     st.caption(
         "Il backup contiene i dati estratti e l'elenco dei documenti, ma non incorpora i PDF/Excel originali. "
-        "I file originali restano nella memoria temporanea della sessione."
+        "Nel file troverai anche il foglio 'Periodo esportato', che indica esattamente il filtro utilizzato."
     )
 
 # =========================================================
